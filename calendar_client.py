@@ -2,10 +2,29 @@ from __future__ import annotations
 import logging
 import random
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
 
 log = logging.getLogger(__name__)
+
+
+def build_task(session, tz_name: str) -> tuple[str, dict]:
+    """Build the (date, task) pair for the append endpoint. Filed under the
+    session's *start* date in the configured timezone (fixes I-23). startTime/
+    endTime are left null -- the live calendar's own UI never actually
+    populates them (confirmed against the deployed app), so fighting an
+    unused, unvalidated format isn't worth it; the time range is folded into
+    the text instead."""
+    started = datetime.fromisoformat(session.started_wall_iso)
+    date = started.strftime("%Y-%m-%d")
+    start_str = started.strftime("%H:%M")
+    end_str = datetime.now(ZoneInfo(tz_name)).strftime("%H:%M")
+    minutes = round(session.focus_elapsed_s / 60)
+    text = f"{session.label} ({minutes}m focus, {start_str}-{end_str})"[:140]
+    task = {"id": session.id, "text": text, "done": True, "startTime": None, "endTime": None}
+    return date, task
 
 MAX_ATTEMPTS = 5
 TIMEOUT_S = 10

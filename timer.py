@@ -171,6 +171,17 @@ class SessionTimer:
         self.state = State.INTERRUPTED
         self._checkpoint()
 
+    def abort_manual(self):
+        """User-initiated Stop button. Distinct from manual_pause/resume (a
+        temporary, resumable break) -- this ends the session outright. Always
+        ABORTED (not FAILED): stopping on purpose isn't a failure to focus,
+        it's just not finishing, so nothing punitive is recorded."""
+        if self.state in TERMINAL_STATES or self.session is None:
+            return
+        if self._on_alarm_stop:
+            self._on_alarm_stop()
+        self._abort("user_stopped")
+
     def manual_resume(self):
         if self.state != State.INTERRUPTED:
             return

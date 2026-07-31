@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.mohammad.pomodoroguard</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Applications/github/Argus/.venv/bin/python</string>
+    <string>/Applications/github/Argus/main.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Applications/github/Argus</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>/Applications/github/Argus/logs/out.log</string>
+  <key>StandardErrorPath</key><string>/Applications/github/Argus/logs/err.log</string>
+</dict>
+</plist>
