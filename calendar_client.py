@@ -1,0 +1,58 @@
+from __future__ import annotations
+import logging
+import random
+import time
+
+import requests
+
+log = logging.getLogger(__name__)
+
+MAX_ATTEMPTS = 5
+TIMEOUT_S = 10
+
+
+class CalendarClientError(Exception):
+    """Non-retryable: bad auth or bad request shape. Retrying won't fix it —
+    caller should surface this loudly rather than spin."""
+
+
+def log_pomodoro(append_url: str, api_key: str, date: str, task: dict) -> None:
+    """POST one task to the atomic append endpoint. Idempotent on task['id'] —
+    the server dedupes, so a retry after a lost response can't duplicate.
+
+    Raises CalendarClientError on 400/401 (won't retry).
+    Raises RuntimeError if transient failures exhaust all retries.
+    """
+    headers = {"x-api-key": api_key, "content-type": "application/json"}
+    body = {"date": date, "task": task}
+
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            r = requests.post(append_url, json=body, headers=headers, timeout=TIMEOUT_S)
+        except requests.RequestException as e:
+            wait = min(60, 1.5 ** attempt) + random.uniform(0, 0.5)
+            log.warning(
+                "calendar append attempt %d/%d failed: %s (retry in %.1fs)",
+                attempt + 1, MAX_ATTEMPTS, e, wait,
+            )
+            time.sleep(wait)
+            continue
+
+        if r.status_code in (400, 401):
+            raise CalendarClientError(f"calendar rejected request: {r.status_code} {r.text[:200]}")
+
+        if r.status_code >= 500:
+            wait = min(60, 1.5 ** attempt) + random.uniform(0, 0.5)
+            log.warning(
+                "calendar append attempt %d/%d got HTTP %d (retry in %.1fs)",
+                attempt + 1, MAX_ATTEMPTS, r.status_code, wait,
+            )
+            time.sleep(wait)
+            continue
+
+        result = r.json().get("result")
+        if result == "duplicate":
+            log.info("session %s already logged — idempotent no-op", task["id"])
+        return
+
+    raise RuntimeError("calendar append failed after retries — left in outbox")
