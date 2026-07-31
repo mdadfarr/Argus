@@ -30,7 +30,7 @@
   "phone_sustain_seconds": 1.0,
   "phone_detect_every_n_ticks": 2,
 
-  "camera_name_hint": "FaceTime HD Camera",
+  "camera_name_hint": "MacBook Air Camera",
   "camera_index": 0,
   "check_interval_ms": 500,
   "max_tick_gap_seconds": 5.0,
