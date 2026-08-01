@@ -131,12 +131,14 @@ class SessionTimer:
         CHECKPOINT_PATH.unlink(missing_ok=True)
 
     # ---------- start / manual pause ----------
-    def start(self, raw_label: str, look_down_enabled: bool):
+    def start(self, raw_label: str, look_down_enabled: bool, minutes: float | None = None):
         if self.state != State.IDLE:
             raise RuntimeError(f"cannot start from state {self.state}")
         label = clean_label(raw_label)
+        if minutes is None:
+            minutes = self.cfg["pomodoro_minutes"]
         minutes = max(self.cfg["min_session_minutes"],
-                      min(self.cfg["max_session_minutes"], self.cfg["pomodoro_minutes"]))
+                      min(self.cfg["max_session_minutes"], minutes))
         now_mono = time.monotonic()
         self.session = Session(
             id=f"pg-{int(time.time() * 1000)}",
@@ -280,7 +282,7 @@ class SessionTimer:
             self.grace_deadline = now + self.cfg["grace_period_seconds"]
             self.resolve_clean_since = None
             if self._on_alarm_start:
-                self._on_alarm_start()
+                self._on_alarm_start(violation_kind)
             if self._on_notify:
                 self._on_notify(f"Violation: {violation_kind}. Return within {self.cfg['grace_period_seconds']:.0f}s.")
             self.state = State.VIOLATION_GRACE

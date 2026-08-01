@@ -15,11 +15,11 @@ class Alarm:
         self.sound_path = sound_path
         self.proc: subprocess.Popen | None = None
 
-    def start(self) -> None:
+    def start(self, sound_path: str | None = None) -> None:
         if self.proc is not None and self.proc.poll() is None:
             return
         try:
-            self.proc = subprocess.Popen(["afplay", self.sound_path])
+            self.proc = subprocess.Popen(["afplay", sound_path or self.sound_path])
         except OSError as e:
             log.error("alarm failed to start: %s", e)
 
