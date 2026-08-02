@@ -92,6 +92,10 @@ class Engine:
     def __init__(self, cfg: dict):
         self.cfg = cfg
         self.lock = threading.RLock()
+        # Never taken while self.lock is held -- both guard work that happens on
+        # background threads precisely so the tick thread never blocks on I/O.
+        self._api_key_lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._api_key_cache: str | None = None
         self.latest_reading: vision.FrameReading | None = None
         self.status_message = ""
@@ -153,11 +157,16 @@ class Engine:
 
     # ---------- calendar auth / outbox ----------
     def _get_api_key(self) -> str:
-        """Raises config_mod.ConfigError if unavailable."""
-        if self._api_key_cache is not None:
+        """Raises config_mod.ConfigError if unavailable.
+
+        Called from several background threads (startup sync, calendar send),
+        and the miss path shells out to `security`, so the cache fill is
+        serialised on its own lock rather than on self.lock."""
+        with self._api_key_lock:
+            if self._api_key_cache is not None:
+                return self._api_key_cache
+            self._api_key_cache = config_mod.load_api_key(self.cfg)
             return self._api_key_cache
-        self._api_key_cache = config_mod.load_api_key(self.cfg)
-        return self._api_key_cache
 
     def _send_to_calendar(self, date: str, task: dict) -> None:
         key = self._get_api_key()
@@ -180,10 +189,13 @@ class Engine:
                         log.warning("calendar preflight failed: %s", msg)
 
             if not warning:
-                try:
-                    outbox.drain(self._send_to_calendar)
-                except Exception as e:
-                    log.warning("outbox drain error: %s", e)
+                # Same lock the per-session sends take, so a drain and a fresh
+                # send can never interleave POSTs for the same outbox.
+                with self._send_lock:
+                    try:
+                        outbox.drain(self._send_to_calendar)
+                    except Exception as e:
+                        log.warning("outbox drain error: %s", e)
 
             with self.lock:
                 self.auth_warning = warning
@@ -258,24 +270,51 @@ class Engine:
             log.info("DRY RUN: would log session %s -> %s / %s", session.id, date, task)
             self.status_message = f"Logged (dry run): {task['text']}"
         else:
+            # Durable first: once this returns the session survives a crash,
+            # so the send itself is free to happen off this thread.
             outbox.add({"date": date, "task": task})
-            try:
-                self._send_to_calendar(date, task)
-                self.status_message = f"Logged: {task['text']}"
-                self.auth_warning = ""
-            except (calendar_client.CalendarClientError, config_mod.ConfigError) as e:
-                # Non-retryable: bad auth or bad request shape. Retrying will
-                # never fix it, so say so rather than claiming it is queued.
-                log.error("calendar rejected session %s: %s", session.id, e)
-                self.status_message = "Saved locally but NOT logged to the calendar."
-                self.auth_warning = str(e)
-            except Exception as e:
-                log.warning("immediate calendar send failed, left in outbox: %s", e)
-                self.status_message = "Queued — will retry syncing to calendar."
+            self.status_message = "Logging to calendar…"
+            self._send_async(session.id, date, task)
 
         ledger.record_session(record)
         self.timer.to_idle()
         self._end_session()
+
+    def _send_async(self, session_id: str, date: str, task: dict) -> None:
+        """Hand the calendar POST to a background thread.
+
+        log_pomodoro() retries five times with a 10s timeout each plus a
+        backoff sleep -- up to ~60s of wall time. Doing that inline left it
+        running under self.lock (this is reached from _loop, which holds the
+        lock for the whole tick), so snapshot() blocked on the pywebview
+        bridge thread and the UI froze: countdown stuck, Stop unresponsive,
+        and no violation or grace expiry processed for the duration.
+
+        Sends are serialised on _send_lock so two sessions finishing close
+        together don't retry over each other or report out of order."""
+
+        def worker():
+            with self._send_lock:
+                try:
+                    self._send_to_calendar(date, task)
+                except (calendar_client.CalendarClientError, config_mod.ConfigError) as e:
+                    # Non-retryable: bad auth or bad request shape. Retrying
+                    # will never fix it, so say so rather than claiming it is
+                    # queued.
+                    log.error("calendar rejected session %s: %s", session_id, e)
+                    message, warning = "Saved locally but NOT logged to the calendar.", str(e)
+                except Exception as e:
+                    log.warning("calendar send failed for %s, left in outbox: %s", session_id, e)
+                    message, warning = "Queued — will retry syncing to calendar.", None
+                else:
+                    message, warning = f"Logged: {task['text']}", ""
+
+            with self.lock:
+                self.status_message = message
+                if warning is not None:
+                    self.auth_warning = warning
+
+        threading.Thread(target=worker, name="argus-calendar-send", daemon=True).start()
 
     # ---------- JS-facing actions ----------
     def start(self, raw_label: str, minutes: float | None, look_down_enabled: bool,
