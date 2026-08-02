@@ -161,6 +161,24 @@ button, input { font-family: inherit; border-radius: 0; }
 .check-text { font-size: 13px; color: var(--ink); }
 .check-note { font-size: 11px; color: var(--muted); display: block; margin-top: 2px; }
 
+/* ---------- live detection readout ---------- */
+.diag { display: flex; gap: 26px; margin: 9px 0 7px; }
+.diag-item { display: flex; flex-direction: column; gap: 3px; }
+.diag-k {
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: #565656;
+}
+.diag-v {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+}
+.diag-v.hot { color: var(--accent); font-weight: 700; }
+.diag-v.on  { color: var(--ink); }
+
 /* ---------- stats ---------- */
 .stats { display: flex; gap: 44px; }
 .stat { display: flex; flex-direction: column; gap: 6px; }

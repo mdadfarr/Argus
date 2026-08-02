@@ -8,83 +8,72 @@
     --bg: #0B0B0B;
     --ink: #FAFAFA;
     --accent: #E8231A;
-    --muted: #7C7C7C;
   }
   * { box-sizing: border-box; }
   html, body {
-    margin: 0; padding: 0; height: 100%;
-    background: var(--bg); color: var(--ink);
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: transparent; color: var(--ink);
     font-family: "Helvetica Neue", Inter, -apple-system, system-ui, Arial, sans-serif;
     -webkit-font-smoothing: antialiased;
     cursor: default;
     user-select: none; -webkit-user-select: none;
     overflow: hidden;
   }
+  /* One box, nothing in it but the time. The progress bar is flush to the
+     bottom edge so it reads as part of the frame rather than as content. */
   .wrap {
-    height: 100%;
+    position: relative;
+    height: 100%; width: 100%;
     background: var(--bg);
     border: 1px solid #2E2E2E;
     display: flex;
-    flex-direction: column;
-    justify-content: space-between;
-  }
-  .top {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    padding: 7px 10px 0;
-  }
-  .tag {
-    font-size: 8px;
-    font-weight: 700;
-    letter-spacing: 0.16em;
-    text-transform: uppercase;
-    color: var(--muted);
+    align-items: center;
+    justify-content: center;
   }
   .time {
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    font-size: 34px;
+    font-size: 40px;
     font-weight: 500;
     letter-spacing: -0.03em;
     font-variant-numeric: tabular-nums;
-    padding: 0 10px 6px;
     line-height: 1;
+    /* nudge up by half the bar so the number is optically centred in the box */
+    transform: translateY(-1px);
   }
-  .bar { height: 3px; width: 100%; background: transparent; }
-  .fill { height: 3px; width: 0%; background: var(--accent); transition: width 0.4s linear; }
+  .bar {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    height: 3px;
+  }
+  .fill {
+    height: 100%; width: 0%;
+    background: var(--accent);
+    transition: width 0.4s linear;
+  }
 
-  /* violation: flood the whole surface red */
   body.violation .wrap { background: var(--accent); border-color: var(--accent); }
-  body.violation, body.violation .tag, body.violation .time { color: #FFFFFF; }
+  body.violation .time { color: #FFFFFF; }
   body.violation .fill { background: #FFFFFF; }
 </style>
 </head>
 <body>
   <div class="wrap">
-    <div class="top">
-      <span class="tag">Argus</span>
-      <span class="tag" id="miniState"></span>
-    </div>
-    <div>
-      <div class="time" id="miniTime">--:--</div>
-      <div class="bar"><div class="fill" id="miniFill"></div></div>
-    </div>
+    <div class="time" id="miniTime">--:--</div>
+    <div class="bar"><div class="fill" id="miniFill"></div></div>
   </div>
 
 <script>
 (() => {
   let apiReady = false;
+  let sawSession = false;
   const timeEl = document.getElementById('miniTime');
   const fillEl = document.getElementById('miniFill');
-  const stateEl = document.getElementById('miniState');
 
   // easy_drag consumes single-click drags, so double-click is the restore
   // gesture (same as the old Tk mini window).
   document.addEventListener('dblclick', () => {
     if (apiReady) window.pywebview.api.exit_mini();
   });
-
-  let sawSession = false;
 
   async function poll() {
     if (apiReady) {
@@ -94,10 +83,7 @@
           timeEl.textContent = s.countdown || '--:--';
           fillEl.style.width =
             `${Math.max(0, Math.min(1, s.progress_frac || 0)) * 100}%`;
-          stateEl.textContent = s.in_violation ? 'return' : (s.headline || '');
           document.body.classList.toggle('violation', !!s.in_violation);
-          // Only ask to close once a session we actually saw has ended --
-          // otherwise this fires every poll while the window sits hidden.
           if (s.session_active) {
             sawSession = true;
           } else if (sawSession) {

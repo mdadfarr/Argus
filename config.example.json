@@ -5,37 +5,39 @@
   "calendar_api_key": null,
   "timezone": "America/Toronto",
   "dry_run": true,
-
   "pomodoro_minutes": 25,
   "min_session_minutes": 5,
   "max_session_minutes": 180,
-
   "grace_period_seconds": 15,
   "grace_on_left": true,
   "max_violations_per_session": 3,
   "max_total_paused_seconds": 90,
   "max_manual_pauses": 1,
   "max_manual_pause_seconds": 120,
-
   "no_face_threshold_seconds": 5,
-
   "detect_look_down": false,
   "look_down_threshold_seconds": 8,
   "look_down_enter_delta_degrees": 20,
   "look_down_release_delta_degrees": 12,
   "calibration_seconds": 5,
-
+  "detect_look_away": true,
+  "look_away_threshold_seconds": 1.5,
+  "look_away_enter_delta_degrees": 40,
+  "look_away_release_delta_degrees": 26,
   "detect_phone": true,
   "phone_confidence_threshold": 0.6,
   "phone_sustain_seconds": 1.0,
   "phone_detect_every_n_ticks": 2,
-
   "camera_name_hint": "MacBook Air Camera",
   "camera_index": 0,
   "check_interval_ms": 500,
   "max_tick_gap_seconds": 5.0,
-  "camera_reopen_backoff_seconds": [1, 2, 5, 10],
-
+  "camera_reopen_backoff_seconds": [
+    1,
+    2,
+    5,
+    10
+  ],
   "alarm_sound_path": "/System/Library/Sounds/Sosumi.aiff",
   "notify_on_failure": true,
   "log_level": "INFO"

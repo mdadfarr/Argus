@@ -48,10 +48,28 @@
           <span class="check-box"></span>
           <span>
             <span class="check-text">Detect looking down</span>
-            <span class="check-note">For screen-only work. Needs the camera on.</span>
+            <span class="check-note">Head tilts down, e.g. at your desk. Needs the camera on.</span>
+          </span>
+        </button>
+        <button id="lookAwayToggle" class="check" data-on="true" type="button">
+          <span class="check-box"></span>
+          <span>
+            <span class="check-text">Detect looking away</span>
+            <span class="check-note">Head turns sideways off the screen. Needs the camera on.</span>
           </span>
         </button>
       </div>
+    </section>
+
+    <section class="band" id="diagBand">
+      <span class="label">Live detection</span>
+      <div class="diag" id="diag">
+        <div class="diag-item"><span class="diag-k">face</span><span class="diag-v" id="dFace">—</span></div>
+        <div class="diag-item"><span class="diag-k">phone</span><span class="diag-v" id="dPhone">—</span></div>
+        <div class="diag-item"><span class="diag-k">down</span><span class="diag-v" id="dPitch">—</span></div>
+        <div class="diag-item"><span class="diag-k">away</span><span class="diag-v" id="dYaw">—</span></div>
+      </div>
+      <span class="check-note" id="diagHint">Starts reporting once a session is running.</span>
     </section>
 
     <section class="band">

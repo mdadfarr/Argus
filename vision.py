@@ -39,6 +39,7 @@ class FrameReading:
     error: str | None = None
     face_present: bool = False
     pitch_delta_deg: float | None = None      # smoothed, relative to calibration baseline
+    yaw_delta_deg: float | None = None        # smoothed |deviation| from baseline, sign-free
     phone_confidence: float = 0.0
     phone_detector_available: bool = True
 
@@ -85,6 +86,16 @@ def pitch_deg(matrix) -> float:
     _load_pitch_sign() / run_sign_calibration_wizard()."""
     R = np.asarray(matrix)[:3, :3]
     return float(np.degrees(np.arctan2(-R[2, 1], R[2, 2])))
+
+
+def yaw_deg(matrix) -> float:
+    """Yaw (head turned left/right) from the same rotation block.
+
+    Unlike pitch, the sign is never needed: turning away to the left and to
+    the right are equally "not looking at the screen", so the caller compares
+    |yaw - baseline|. That sidesteps the sign-calibration problem entirely."""
+    R = np.asarray(matrix)[:3, :3]
+    return float(np.degrees(np.arctan2(R[2, 0], np.hypot(R[2, 1], R[2, 2]))))
 
 
 def _load_pitch_sign() -> int:
@@ -204,11 +215,13 @@ class VisionWorker(threading.Thread):
         self._stop = threading.Event()
 
         self._calibrating = False
-        self._calib_samples: list[tuple[float, float]] = []
+        self._calib_samples: list[tuple[float, float, float]] = []   # (ts, pitch, yaw)
         self._calib_start = 0.0
         self._baseline_pitch: float | None = None
+        self._baseline_yaw: float | None = None
         self._pitch_sign = _load_pitch_sign()
         self._pitch_ema: float | None = None
+        self._yaw_ema: float | None = None
 
         self._tick_count = 0
         self._last_phone_confidence = 0.0
@@ -278,15 +291,29 @@ class VisionWorker(threading.Thread):
         self._calib_start = time.monotonic()
         self._calibrating = True
         self._baseline_pitch = None
+        self._baseline_yaw = None
         self._pitch_ema = None
+        self._yaw_ema = None
 
     def finish_calibration(self) -> None:
         """Discards the first second of samples (settling time) and takes the
-        median of the rest as baseline_pitch -- what makes a fixed relative
-        threshold work across different desks and lid angles (fixes I-08)."""
+        median of the rest as the baseline -- what makes a fixed relative
+        threshold work across different desks and lid angles (fixes I-08).
+
+        MUST be called when the calibration window closes. It previously was
+        not called anywhere at all, so _calibrating stayed True forever,
+        _baseline_pitch stayed None, and pitch_delta_deg was therefore always
+        None -- which silently made look-down detection impossible to trigger
+        no matter how it was configured."""
         self._calibrating = False
-        usable = sorted(p for (ts, p) in self._calib_samples if ts - self._calib_start >= 1.0)
-        self._baseline_pitch = usable[len(usable) // 2] if usable else None
+        usable_p = sorted(p for (ts, p, y) in self._calib_samples if ts - self._calib_start >= 1.0)
+        usable_y = sorted(y for (ts, p, y) in self._calib_samples if ts - self._calib_start >= 1.0)
+        self._baseline_pitch = usable_p[len(usable_p) // 2] if usable_p else None
+        self._baseline_yaw = usable_y[len(usable_y) // 2] if usable_y else None
+        log.info("calibration finished: baseline pitch=%s yaw=%s (%d samples)",
+                 None if self._baseline_pitch is None else round(self._baseline_pitch, 1),
+                 None if self._baseline_yaw is None else round(self._baseline_yaw, 1),
+                 len(usable_p))
 
     @property
     def calibrated(self) -> bool:
@@ -377,17 +404,26 @@ class VisionWorker(threading.Thread):
 
         face_present = False
         pitch_delta = None
+        yaw_delta = None
         if self.face_landmarker is not None:
             result = self.face_landmarker.detect(mp_image)
             face_present = len(result.face_landmarks) > 0
             if face_present and result.facial_transformation_matrixes:
-                raw_pitch = pitch_deg(result.facial_transformation_matrixes[0])
+                matrix = result.facial_transformation_matrixes[0]
+                raw_pitch = pitch_deg(matrix)
+                raw_yaw = yaw_deg(matrix)
                 if self._calibrating:
-                    self._calib_samples.append((time.monotonic(), raw_pitch))
-                elif self._baseline_pitch is not None:
-                    delta = (raw_pitch - self._baseline_pitch) * self._pitch_sign
-                    self._pitch_ema = delta if self._pitch_ema is None else (0.3 * delta + 0.7 * self._pitch_ema)
-                    pitch_delta = self._pitch_ema
+                    self._calib_samples.append((time.monotonic(), raw_pitch, raw_yaw))
+                else:
+                    if self._baseline_pitch is not None:
+                        delta = (raw_pitch - self._baseline_pitch) * self._pitch_sign
+                        self._pitch_ema = delta if self._pitch_ema is None else (0.3 * delta + 0.7 * self._pitch_ema)
+                        pitch_delta = self._pitch_ema
+                    if self._baseline_yaw is not None:
+                        # absolute deviation: turning either way counts equally
+                        d = abs(raw_yaw - self._baseline_yaw)
+                        self._yaw_ema = d if self._yaw_ema is None else (0.3 * d + 0.7 * self._yaw_ema)
+                        yaw_delta = self._yaw_ema
 
         phone_confidence = self._last_phone_confidence
         if self.phone_detector is not None and self.cfg.get("detect_phone", True):
@@ -406,6 +442,7 @@ class VisionWorker(threading.Thread):
             ok=True,
             face_present=face_present,
             pitch_delta_deg=pitch_delta,
+            yaw_delta_deg=yaw_delta,
             phone_confidence=phone_confidence,
             phone_detector_available=self.phone_detector is not None,
         )

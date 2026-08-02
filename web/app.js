@@ -9,6 +9,9 @@
   const minutesInput = el('minutesInput');
   const cameraToggle = el('cameraToggle');
   const lookDownToggle = el('lookDownToggle');
+  const lookAwayToggle = el('lookAwayToggle');
+  const dFace = el('dFace'), dPhone = el('dPhone'), dPitch = el('dPitch'), dYaw = el('dYaw');
+  const diagHint = el('diagHint');
   const statCamera = el('statCamera');
   const statState = el('statState');
   const statViolations = el('statViolations');
@@ -26,6 +29,7 @@
   let apiReady = false;
   let cameraOn = true;
   let lookDownOn = false;
+  let lookAwayOn = true;
   let defaultsApplied = false;
   let miniShown = false;
 
@@ -34,13 +38,15 @@
   cameraToggle.addEventListener('click', () => {
     cameraOn = !cameraOn;
     setToggle(cameraToggle, cameraOn);
-    // Look-down detection is meaningless without the camera.
-    if (!cameraOn && lookDownOn) {
-      lookDownOn = false;
-      setToggle(lookDownToggle, false);
+    // Head-pose detection is meaningless without the camera.
+    if (!cameraOn) {
+      lookDownOn = false; setToggle(lookDownToggle, false);
+      lookAwayOn = false; setToggle(lookAwayToggle, false);
     }
-    lookDownToggle.disabled = !cameraOn;
-    lookDownToggle.style.opacity = cameraOn ? '1' : '0.35';
+    for (const t of [lookDownToggle, lookAwayToggle]) {
+      t.disabled = !cameraOn;
+      t.style.opacity = cameraOn ? '1' : '0.35';
+    }
   });
 
   lookDownToggle.addEventListener('click', () => {
@@ -49,13 +55,46 @@
     setToggle(lookDownToggle, lookDownOn);
   });
 
+  lookAwayToggle.addEventListener('click', () => {
+    if (!cameraOn) return;
+    lookAwayOn = !lookAwayOn;
+    setToggle(lookAwayToggle, lookAwayOn);
+  });
+
+  function renderDiag(d) {
+    if (!d || !d.active) {
+      for (const n of [dFace, dPhone, dPitch, dYaw]) {
+        n.textContent = '—'; n.className = 'diag-v';
+      }
+      diagHint.textContent = 'Starts reporting once a session is running.';
+      return;
+    }
+    dFace.textContent = d.face ? 'yes' : 'NO';
+    dFace.className = 'diag-v' + (d.face ? ' on' : ' hot');
+
+    dPhone.textContent = d.phone.toFixed(2);
+    dPhone.className = 'diag-v' + (d.phone >= d.phone_threshold ? ' hot' : (d.phone > 0 ? ' on' : ''));
+
+    const fmt = (v, thr, node) => {
+      if (v === null || v === undefined) { node.textContent = 'n/a'; node.className = 'diag-v'; return; }
+      node.textContent = `${v}°`;
+      node.className = 'diag-v' + (v >= thr ? ' hot' : ' on');
+    };
+    fmt(d.pitch, d.pitch_threshold, dPitch);
+    fmt(d.yaw, d.yaw_threshold, dYaw);
+
+    diagHint.textContent = d.calibrated
+      ? `thresholds — phone ${d.phone_threshold}, down ${d.pitch_threshold}°, away ${d.yaw_threshold}°`
+      : 'calibrating… hold still and look at the screen';
+  }
+
   startBtn.addEventListener('click', async () => {
     if (!apiReady) return;
     const minutes = parseFloat(minutesInput.value);
     startBtn.disabled = true;
     try {
       const res = await window.pywebview.api.start(
-        labelInput.value, isNaN(minutes) ? null : minutes, lookDownOn, cameraOn
+        labelInput.value, isNaN(minutes) ? null : minutes, lookDownOn, cameraOn, lookAwayOn
       );
       if (res && res.error) {
         statusMessage.textContent = res.error;
@@ -113,6 +152,8 @@
       thumbPlaceholder.style.display = 'flex';
       thumbPlaceholder.textContent = s.camera_on ? 'no signal' : 'camera off';
     }
+
+    renderDiag(s.diag);
 
     statusMessage.textContent = s.status_message || '';
     setBanner(authBanner, s.auth_warning, true);

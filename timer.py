@@ -49,6 +49,7 @@ class Session:
     started_wall_iso: str
     started_mono: float
     look_down_enabled: bool = False
+    look_away_enabled: bool = False
     camera_enabled: bool = True
     focus_elapsed_s: float = 0.0
     paused_total_s: float = 0.0
@@ -70,7 +71,8 @@ class SessionTimer:
     """
 
     def __init__(self, cfg: dict, on_camera_open=None, on_camera_close=None,
-                 on_calibrate_start=None, on_alarm_start=None, on_alarm_stop=None,
+                 on_calibrate_start=None, on_calibrate_finish=None,
+                 on_alarm_start=None, on_alarm_stop=None,
                  on_notify=None):
         self.cfg = cfg
         self.state = State.IDLE
@@ -85,13 +87,16 @@ class SessionTimer:
         self.resolve_clean_since: float | None = None
         self.last_outcome: dict | None = None
         self._look_down_state = False
+        self._look_away_state = False
         self.left_cond = SustainedCondition(cfg["no_face_threshold_seconds"])
         self.phone_cond = SustainedCondition(cfg["phone_sustain_seconds"])
         self.look_down_cond = SustainedCondition(cfg["look_down_threshold_seconds"])
+        self.look_away_cond = SustainedCondition(cfg.get("look_away_threshold_seconds", 6))
 
         self._on_camera_open = on_camera_open
         self._on_camera_close = on_camera_close
         self._on_calibrate_start = on_calibrate_start
+        self._on_calibrate_finish = on_calibrate_finish
         self._on_alarm_start = on_alarm_start
         self._on_alarm_stop = on_alarm_stop
         self._on_notify = on_notify
@@ -133,7 +138,7 @@ class SessionTimer:
 
     # ---------- start / manual pause ----------
     def start(self, raw_label: str, look_down_enabled: bool, minutes: float | None = None,
-              camera_enabled: bool = True):
+              camera_enabled: bool = True, look_away_enabled: bool = False):
         if self.state != State.IDLE:
             raise RuntimeError(f"cannot start from state {self.state}")
         label = clean_label(raw_label)
@@ -149,13 +154,16 @@ class SessionTimer:
             started_wall_iso=datetime.now(ZoneInfo(self.cfg["timezone"])).isoformat(),
             started_mono=now_mono,
             look_down_enabled=look_down_enabled and camera_enabled,
+            look_away_enabled=look_away_enabled and camera_enabled,
             camera_enabled=camera_enabled,
         )
         self.last_tick = now_mono
         self._look_down_state = False
+        self._look_away_state = False
         self.left_cond.reset()
         self.phone_cond.reset()
         self.look_down_cond.reset()
+        self.look_away_cond.reset()
         self.camera_backoff_idx = 0
 
         if not camera_enabled:
@@ -253,6 +261,14 @@ class SessionTimer:
                     self._on_notify("Calibration failed: no face detected. Session cancelled.")
                 self._to_idle_after_cancel()
                 return
+            # Close the calibration window and commit the baselines. Without
+            # this the vision worker stays in calibrating mode forever and
+            # never reports a pitch/yaw delta at all.
+            if self._on_calibrate_finish:
+                self._on_calibrate_finish()
+            self._look_down_state = False
+            self._look_away_state = False
+            self._pitch_ema_seen = False
             self.state = State.RUNNING
             self.last_tick = now
             self._checkpoint()
@@ -267,6 +283,19 @@ class SessionTimer:
         elif d < self.cfg["look_down_release_delta_degrees"]:
             self._look_down_state = False
         # else: inside the hysteresis dead zone -- keep previous latch value
+
+    def _update_look_away_latch(self, reading) -> None:
+        """Head turned sideways. reading.yaw_delta_deg is already an absolute
+        deviation from the calibrated baseline, so left and right are treated
+        identically and no sign calibration is needed."""
+        if not self.session.look_away_enabled or reading.yaw_delta_deg is None:
+            self._look_away_state = False
+            return
+        d = reading.yaw_delta_deg
+        if d > self.cfg.get("look_away_enter_delta_degrees", 28):
+            self._look_away_state = True
+        elif d < self.cfg.get("look_away_release_delta_degrees", 18):
+            self._look_away_state = False
 
     def _tick_running(self, now, dt, reading):
         self.session.focus_elapsed_s += dt
@@ -313,6 +342,7 @@ class SessionTimer:
     def _evaluate_violation(self, dt, reading) -> str | None:
         cfg = self.cfg
         self._update_look_down_latch(reading)
+        self._update_look_away_latch(reading)
 
         left_sustained = self.left_cond.update(not reading.face_present, dt)
 
@@ -323,6 +353,7 @@ class SessionTimer:
         phone_sustained = self.phone_cond.update(phone_now, dt)
 
         look_down_sustained = self.look_down_cond.update(self._look_down_state, dt)
+        look_away_sustained = self.look_away_cond.update(self._look_away_state, dt)
 
         if left_sustained:
             return "left"
@@ -330,10 +361,13 @@ class SessionTimer:
             return "phone"
         if look_down_sustained:
             return "look_down"
+        if look_away_sustained:
+            return "look_away"
         return None
 
     def _reset_condition(self, kind: str) -> None:
-        {"left": self.left_cond, "phone": self.phone_cond, "look_down": self.look_down_cond}[kind].reset()
+        {"left": self.left_cond, "phone": self.phone_cond,
+         "look_down": self.look_down_cond, "look_away": self.look_away_cond}[kind].reset()
 
     def _tick_grace(self, now, dt, reading):
         self.session.paused_total_s += dt
@@ -355,11 +389,13 @@ class SessionTimer:
             return
 
         self._update_look_down_latch(reading)
+        self._update_look_away_latch(reading)
         raw_phone = (
             self.cfg["detect_phone"] and reading.phone_detector_available
             and reading.phone_confidence >= self.cfg["phone_confidence_threshold"]
         )
-        clean = reading.face_present and not raw_phone and not self._look_down_state
+        clean = (reading.face_present and not raw_phone
+                 and not self._look_down_state and not self._look_away_state)
         if clean:
             if self.resolve_clean_since is None:
                 self.resolve_clean_since = now
@@ -452,5 +488,6 @@ class SessionTimer:
             "manual_pauses": s.manual_pauses,
             "degraded": s.degraded,
             "look_down_enabled": s.look_down_enabled,
+            "look_away_enabled": s.look_away_enabled,
             "camera_enabled": s.camera_enabled,
         }

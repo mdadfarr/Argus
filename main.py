@@ -42,6 +42,11 @@ SOUNDS_DIR = Path(__file__).parent / "sounds"
 VIOLATION_SOUNDS = {
     "left": SOUNDS_DIR / "left_room.aiff",
     "look_down": SOUNDS_DIR / "looked_down.aiff",
+    # Reuses looked_down.aiff rather than the synthesized looked_away.aiff --
+    # that file was hand-built and unverifiable outside macOS, so it's safer
+    # to point at a real, known-working sound. Drop sounds/looked_away.aiff
+    # in and flip this back if you'd rather have a distinct sound later.
+    "look_away": SOUNDS_DIR / "looked_down.aiff",
     "phone": SOUNDS_DIR / "phone_detected.aiff",
 }
 
@@ -111,6 +116,7 @@ class Engine:
             on_camera_open=self._open_camera,
             on_camera_close=self._close_camera,
             on_calibrate_start=self._start_calibration,
+            on_calibrate_finish=self._finish_calibration,
             on_alarm_start=self._on_alarm_start,
             on_alarm_stop=self.alarm.stop,
             on_notify=self._notify,
@@ -132,6 +138,9 @@ class Engine:
 
     def _start_calibration(self) -> None:
         self.worker.start_calibration()
+
+    def _finish_calibration(self) -> None:
+        self.worker.finish_calibration()
 
     def _notify(self, message: str) -> None:
         self.status_message = message
@@ -270,11 +279,12 @@ class Engine:
 
     # ---------- JS-facing actions ----------
     def start(self, raw_label: str, minutes: float | None, look_down_enabled: bool,
-              camera_enabled: bool) -> dict:
+              camera_enabled: bool, look_away_enabled: bool = False) -> dict:
         with self.lock:
             try:
                 self.timer.start(raw_label, look_down_enabled, minutes=minutes,
-                                 camera_enabled=camera_enabled)
+                                 camera_enabled=camera_enabled,
+                                 look_away_enabled=look_away_enabled)
             except (ValueError, RuntimeError) as e:
                 return {"error": str(e)}
             self.status_message = ""
@@ -300,6 +310,24 @@ class Engine:
                 ledger.record_false_positive(self.timer.session.id, asdict(self.latest_reading))
                 self.status_message = "Logged current readings for later threshold tuning."
         return {"ok": True}
+
+    def _diagnostics(self, camera_on: bool) -> dict:
+        """Live detector output, surfaced so thresholds can be tuned against
+        real numbers instead of guesswork."""
+        r = self.latest_reading
+        if not camera_on or r is None:
+            return {"active": False}
+        return {
+            "active": True,
+            "face": bool(r.face_present),
+            "phone": round(float(r.phone_confidence), 2),
+            "phone_threshold": self.cfg["phone_confidence_threshold"],
+            "pitch": None if r.pitch_delta_deg is None else round(r.pitch_delta_deg, 1),
+            "pitch_threshold": self.cfg["look_down_enter_delta_degrees"],
+            "yaw": None if r.yaw_delta_deg is None else round(r.yaw_delta_deg, 1),
+            "yaw_threshold": self.cfg.get("look_away_enter_delta_degrees", 28),
+            "calibrated": self.worker.calibrated,
+        }
 
     # ---------- snapshot for JS polling ----------
     def snapshot(self) -> dict:
@@ -357,6 +385,7 @@ class Engine:
                 "thumbnail_b64": self.thumbnail_b64 if camera_on else None,
                 "default_minutes": self.cfg["pomodoro_minutes"],
                 "dry_run": bool(self.cfg["dry_run"]),
+                "diag": self._diagnostics(camera_on),
                 "buttons": {
                     "start_enabled": state == State.IDLE and not self._syncing,
                     "pause_enabled": state in (State.RUNNING, State.INTERRUPTED),
@@ -401,6 +430,7 @@ BOOTING_SNAPSHOT = {
     "thumbnail_b64": None,
     "default_minutes": None,
     "dry_run": False,
+    "diag": {"active": False},
     "buttons": {
         "start_enabled": False,
         "pause_enabled": False,
@@ -443,14 +473,16 @@ class Api:
         self._engine = engine
 
     # -- session control --
-    def start(self, label: str, minutes, look_down: bool, camera: bool) -> dict:
+    def start(self, label: str, minutes, look_down: bool, camera: bool,
+              look_away: bool = False) -> dict:
         if self._engine is None:
             return {"error": "Still starting up — try again in a moment."}
         try:
             m = float(minutes) if minutes is not None else None
         except (TypeError, ValueError):
             m = None
-        return self._engine.start(label or "", m, bool(look_down), bool(camera))
+        return self._engine.start(label or "", m, bool(look_down), bool(camera),
+                                  bool(look_away))
 
     def pause_resume(self) -> dict:
         return {"ok": True} if self._engine is None else self._engine.pause_resume()
@@ -522,8 +554,8 @@ def main() -> None:
         "Argus Timer",
         str(WEB_DIR / "mini.html"),
         js_api=api,
-        width=210,
-        height=104,
+        width=168,
+        height=68,
         frameless=True,
         easy_drag=True,
         on_top=True,
