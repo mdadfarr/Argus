@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import hashlib
 import json
 import logging
@@ -6,10 +7,22 @@ import queue
 import subprocess
 import threading
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
+
+# Must be installed before mediapipe is imported -- it emits this from module
+# scope, once per import path it touches. Only logs/app.log rotates;
+# logs/err.log is a raw launchd/app-bundle stderr redirect that grows forever,
+# and this warning was the entirety of its contents.
+warnings.filterwarnings(
+    "ignore",
+    message=r"SymbolDatabase\.GetPrototype\(\) is deprecated",
+    category=UserWarning,
+)
+
 import mediapipe as mp
 import numpy as np
 from mediapipe.tasks import python as mp_python
@@ -214,6 +227,12 @@ class VisionWorker(threading.Thread):
         self._open_done = threading.Event()
         self._stop = threading.Event()
 
+        # Calibration state is written by the tick thread (via SessionTimer's
+        # callbacks) and read by this thread inside _read_once, so it needs the
+        # same treatment self.cap gets from _cap_lock. Without it,
+        # start_calibration() could rebind _calib_samples while _read_once
+        # still held the old list, silently dropping samples from the baseline.
+        self._calib_lock = threading.Lock()
         self._calibrating = False
         self._calib_samples: list[tuple[float, float, float]] = []   # (ts, pitch, yaw)
         self._calib_start = 0.0
@@ -273,9 +292,15 @@ class VisionWorker(threading.Thread):
         with self._cap_lock:
             if self.cap is not None:
                 return True
+        # Clearing _open_result matters: on timeout the old code returned
+        # whatever the *previous* open produced, so a stale True sent the timer
+        # into CALIBRATING against a camera that was never opened.
+        self._open_result = None
         self._open_done.clear()
         self._open_requested.set()
-        self._open_done.wait(timeout)
+        if not self._open_done.wait(timeout):
+            log.warning("camera open did not complete within %.1fs", timeout)
+            return False
         return bool(self._open_result)
 
     def request_close(self) -> None:
@@ -287,13 +312,18 @@ class VisionWorker(threading.Thread):
 
     # ---------- calibration ----------
     def start_calibration(self) -> None:
-        self._calib_samples = []
-        self._calib_start = time.monotonic()
-        self._calibrating = True
-        self._baseline_pitch = None
-        self._baseline_yaw = None
-        self._pitch_ema = None
-        self._yaw_ema = None
+        with self._calib_lock:
+            self._calib_samples = []
+            self._calib_start = time.monotonic()
+            self._calibrating = True
+            self._baseline_pitch = None
+            self._baseline_yaw = None
+            self._pitch_ema = None
+            self._yaw_ema = None
+            # Otherwise the previous session's last reading is still reported
+            # on every tick that skips detection (phone_detect_every_n_ticks),
+            # counting toward the new session's phone_sustain_seconds budget.
+            self._last_phone_confidence = 0.0
 
     def finish_calibration(self) -> None:
         """Discards the first second of samples (settling time) and takes the
@@ -305,11 +335,14 @@ class VisionWorker(threading.Thread):
         _baseline_pitch stayed None, and pitch_delta_deg was therefore always
         None -- which silently made look-down detection impossible to trigger
         no matter how it was configured."""
-        self._calibrating = False
-        usable_p = sorted(p for (ts, p, y) in self._calib_samples if ts - self._calib_start >= 1.0)
-        usable_y = sorted(y for (ts, p, y) in self._calib_samples if ts - self._calib_start >= 1.0)
-        self._baseline_pitch = usable_p[len(usable_p) // 2] if usable_p else None
-        self._baseline_yaw = usable_y[len(usable_y) // 2] if usable_y else None
+        with self._calib_lock:
+            self._calibrating = False
+            samples = list(self._calib_samples)
+            start = self._calib_start
+            usable_p = sorted(p for (ts, p, y) in samples if ts - start >= 1.0)
+            usable_y = sorted(y for (ts, p, y) in samples if ts - start >= 1.0)
+            self._baseline_pitch = usable_p[len(usable_p) // 2] if usable_p else None
+            self._baseline_yaw = usable_y[len(usable_y) // 2] if usable_y else None
         log.info("calibration finished: baseline pitch=%s yaw=%s (%d samples)",
                  None if self._baseline_pitch is None else round(self._baseline_pitch, 1),
                  None if self._baseline_yaw is None else round(self._baseline_yaw, 1),
@@ -317,7 +350,8 @@ class VisionWorker(threading.Thread):
 
     @property
     def calibrated(self) -> bool:
-        return self._baseline_pitch is not None
+        with self._calib_lock:
+            return self._baseline_pitch is not None
 
     # ---------- main loop ----------
     def run(self) -> None:
@@ -348,15 +382,14 @@ class VisionWorker(threading.Thread):
                     reading = None
                 else:
                     reading = self._read_once(cap)
-                    if not reading.ok:
-                        # Release on any read failure so the next
-                        # request_open() call (driven by timer.py's backoff
-                        # schedule) actually attempts a fresh open instead of
-                        # trivially reporting success against a stale, broken
-                        # capture handle.
-                        if self.cap is not None:
-                            self.cap.release()
-                            self.cap = None
+                    # Release on any read failure so the next
+                    # request_open() call (driven by timer.py's backoff
+                    # schedule) actually attempts a fresh open instead of
+                    # trivially reporting success against a stale, broken
+                    # capture handle.
+                    if not reading.ok and self.cap is not None:
+                        self.cap.release()
+                        self.cap = None
 
             if reading is None:
                 time.sleep(0.05)
@@ -412,18 +445,19 @@ class VisionWorker(threading.Thread):
                 matrix = result.facial_transformation_matrixes[0]
                 raw_pitch = pitch_deg(matrix)
                 raw_yaw = yaw_deg(matrix)
-                if self._calibrating:
-                    self._calib_samples.append((time.monotonic(), raw_pitch, raw_yaw))
-                else:
-                    if self._baseline_pitch is not None:
-                        delta = (raw_pitch - self._baseline_pitch) * self._pitch_sign
-                        self._pitch_ema = delta if self._pitch_ema is None else (0.3 * delta + 0.7 * self._pitch_ema)
-                        pitch_delta = self._pitch_ema
-                    if self._baseline_yaw is not None:
-                        # absolute deviation: turning either way counts equally
-                        d = abs(raw_yaw - self._baseline_yaw)
-                        self._yaw_ema = d if self._yaw_ema is None else (0.3 * d + 0.7 * self._yaw_ema)
-                        yaw_delta = self._yaw_ema
+                with self._calib_lock:
+                    if self._calibrating:
+                        self._calib_samples.append((time.monotonic(), raw_pitch, raw_yaw))
+                    else:
+                        if self._baseline_pitch is not None:
+                            delta = (raw_pitch - self._baseline_pitch) * self._pitch_sign
+                            self._pitch_ema = delta if self._pitch_ema is None else (0.3 * delta + 0.7 * self._pitch_ema)
+                            pitch_delta = self._pitch_ema
+                        if self._baseline_yaw is not None:
+                            # absolute deviation: turning either way counts equally
+                            d = abs(raw_yaw - self._baseline_yaw)
+                            self._yaw_ema = d if self._yaw_ema is None else (0.3 * d + 0.7 * self._yaw_ema)
+                            yaw_delta = self._yaw_ema
 
         phone_confidence = self._last_phone_confidence
         if self.phone_detector is not None and self.cfg.get("detect_phone", True):
@@ -507,6 +541,7 @@ def sys_exit(msg: str) -> None:
 
 if __name__ == "__main__":
     import sys as _sys
+
     import config as _config
     if "--calibrate-sign" in _sys.argv:
         run_sign_calibration_wizard(_config.load_config())

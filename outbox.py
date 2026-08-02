@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import json
 import logging
 import os
@@ -40,19 +41,26 @@ def remove(task_id: str) -> None:
     _rewrite([e for e in read_all() if e["task"]["id"] != task_id])
 
 
-def drain(sender) -> None:
+def drain(sender, is_permanent=lambda exc: False) -> None:
     """sender(date, task) -> None, raising on failure.
 
     Drains in order and deletes each entry only after sender() returns
-    successfully. Stops at the first failure rather than skipping ahead, so a
-    persistent auth/network problem doesn't get silently swallowed for later
-    entries — the caller (main.py, on a timer or at startup) just calls
-    drain() again later.
+    successfully. Stops at the first *transient* failure rather than skipping
+    ahead, so a network outage doesn't get silently swallowed for later
+    entries — the caller just calls drain() again later.
+
+    is_permanent(exc) marks a failure that retrying can never fix (bad auth,
+    malformed request). Those entries are dropped and the drain continues:
+    halting on them meant one poison entry blocked every later session from
+    ever syncing, forever.
     """
     for entry in read_all():
+        task_id = entry["task"]["id"]
         try:
             sender(entry["date"], entry["task"])
         except Exception as e:
-            log.warning("outbox drain stopped at %s: %s", entry["task"]["id"], e)
-            return
-        remove(entry["task"]["id"])
+            if not is_permanent(e):
+                log.warning("outbox drain stopped at %s: %s", task_id, e)
+                return
+            log.error("dropping permanently rejected outbox entry %s: %s", task_id, e)
+        remove(task_id)

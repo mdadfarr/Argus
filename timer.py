@@ -1,9 +1,10 @@
 from __future__ import annotations
+
 import json
 import logging
 import os
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -25,13 +26,12 @@ class State(str, Enum):
     VIOLATION_GRACE = "VIOLATION_GRACE"
     INTERRUPTED = "INTERRUPTED"
     CAMERA_ERROR = "CAMERA_ERROR"
-    SUCCESS = "SUCCESS"
     LOGGING = "LOGGING"
     FAILED = "FAILED"
     ABORTED = "ABORTED"
 
 
-TERMINAL_STATES = (State.IDLE, State.SUCCESS, State.LOGGING, State.FAILED, State.ABORTED)
+TERMINAL_STATES = (State.IDLE, State.LOGGING, State.FAILED, State.ABORTED)
 
 
 def clean_label(raw: str) -> str:
@@ -268,7 +268,6 @@ class SessionTimer:
                 self._on_calibrate_finish()
             self._look_down_state = False
             self._look_away_state = False
-            self._pitch_ema_seen = False
             self.state = State.RUNNING
             self.last_tick = now
             self._checkpoint()

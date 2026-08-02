@@ -1,0 +1,23 @@
+target-version = "py311"
+line-length = 100
+# Vendored plugin code, not part of this project.
+exclude = [".agents", ".venv", "Argus.app"]
+
+[lint]
+# Pinned explicitly so CI doesn't drift when ruff changes its defaults.
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",    # long lines are usually explanatory comments here
+    "SIM105",  # contextlib.suppress reads worse than try/except/pass at these sites
+    "B008",    # function call in default arg -- used deliberately in outbox.drain
+    "UP042",   # State(str, Enum) is load-bearing; StrEnum changes str() and
+               # this type is serialised into state/sessions.jsonl
+]
+
+[lint.per-file-ignores]
+# The warnings filter must be installed before mediapipe is imported, so those
+# imports cannot sit at the top of the file. See the comment there.
+"vision.py" = ["E402"]
+# Tests define throwaway stand-in classes and import inside functions to keep
+# module import order under the fixtures' control.
+"tests/*" = ["B011", "E731"]

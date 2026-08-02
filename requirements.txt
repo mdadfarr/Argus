@@ -1,5 +1,18 @@
 opencv-contrib-python==4.10.0.84
 mediapipe==0.10.14
-Pillow==10.4.0
-requests==2.32.3
-pywebview>=5.3
+Pillow==12.3.0
+requests==2.34.2
+pywebview==5.3.2
+
+# Transitive, but pinned deliberately: mediapipe 0.10.14 declares no upper
+# bound on numpy, and a fresh resolve picks whatever is current. These are the
+# versions this app is known to run against.
+numpy==2.4.6
+#
+# protobuf is held at 4.x by mediapipe ("protobuf <5,>=4.25.3"). That leaves
+# PYSEC-2026-1805 unfixed -- it needs protobuf >= 5.29.6, which cannot be
+# installed without dropping mediapipe. Accepted: the only protobuf input in
+# this app is the two model files under models/, which are local and
+# SHA-256-verified before load, so no untrusted message ever reaches the
+# parser. Revisit when mediapipe ships a protobuf 5 release.
+protobuf==4.25.9

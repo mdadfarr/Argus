@@ -1,11 +1,31 @@
 from __future__ import annotations
+
 import json
 import subprocess
 import sys
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 ROOT = Path(__file__).parent
 DEFAULT_CONFIG_PATH = ROOT / "config.json"
+
+# Every key the app reads as cfg["..."]. A missing one used to surface as a
+# KeyError deep inside Engine.__init__ or a tick, on a background thread, where
+# it was logged and swallowed -- the UI just hung. Checking presence up front
+# turns all of those into one clear message before the window ever opens.
+REQUIRED_KEYS = (
+    "alarm_sound_path", "calendar_api_key_source", "calendar_api_url",
+    "calendar_append_url", "calibration_seconds", "camera_reopen_backoff_seconds",
+    "check_interval_ms", "detect_phone", "dry_run", "grace_on_left",
+    "grace_period_seconds", "log_level", "look_down_enter_delta_degrees",
+    "look_down_release_delta_degrees", "look_down_threshold_seconds",
+    "max_manual_pause_seconds", "max_manual_pauses", "max_session_minutes",
+    "max_tick_gap_seconds", "max_total_paused_seconds",
+    "max_violations_per_session", "min_session_minutes",
+    "no_face_threshold_seconds", "notify_on_failure",
+    "phone_confidence_threshold", "phone_sustain_seconds", "pomodoro_minutes",
+    "timezone",
+)
 
 
 class ConfigError(Exception):
@@ -18,9 +38,19 @@ def _require(cond: bool, msg: str) -> None:
 
 
 def _validate(cfg: dict) -> None:
+    missing = [k for k in REQUIRED_KEYS if k not in cfg]
+    _require(not missing, f"missing required key(s): {', '.join(missing)}")
+
     for url_key in ("calendar_api_url", "calendar_append_url"):
         url = cfg.get(url_key, "")
         _require(url.startswith("https://"), f"{url_key} must use https")
+
+    # Unvalidated, this reached ZoneInfo() only at session-logging time, where
+    # ZoneInfoNotFoundError wedged the state machine in LOGGING forever.
+    try:
+        ZoneInfo(cfg["timezone"])
+    except (ZoneInfoNotFoundError, ValueError) as e:
+        raise ConfigError(f"timezone {cfg['timezone']!r} is not a valid IANA zone ({e})") from e
 
     _require(
         cfg["min_session_minutes"] <= cfg["pomodoro_minutes"] <= cfg["max_session_minutes"],
@@ -39,6 +69,38 @@ def _validate(cfg: dict) -> None:
         cfg["calendar_api_key_source"] in ("keychain", "config"),
         "calendar_api_key_source must be 'keychain' or 'config'",
     )
+
+    for count_key in ("max_violations_per_session", "max_manual_pauses"):
+        _require(cfg[count_key] >= 0, f"{count_key} must be >= 0")
+
+    backoffs = cfg["camera_reopen_backoff_seconds"]
+    _require(
+        isinstance(backoffs, list) and len(backoffs) >= 2 and all(b > 0 for b in backoffs),
+        "camera_reopen_backoff_seconds must be a list of at least 2 positive numbers",
+    )
+
+    _require(
+        0.0 < cfg["phone_confidence_threshold"] <= 1.0,
+        "phone_confidence_threshold must be in (0, 1]",
+    )
+
+    # Hysteresis: release must sit below enter or the latch never clears.
+    for enter_key, release_key, default_enter, default_release in (
+        ("look_down_enter_delta_degrees", "look_down_release_delta_degrees", None, None),
+        ("look_away_enter_delta_degrees", "look_away_release_delta_degrees", 28, 18),
+    ):
+        enter = cfg[enter_key] if default_enter is None else cfg.get(enter_key, default_enter)
+        release = cfg[release_key] if default_release is None else cfg.get(release_key, default_release)
+        _require(release < enter, f"{release_key} must be < {enter_key}")
+
+    _require(
+        cfg["log_level"].upper() in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
+        f"log_level {cfg['log_level']!r} is not a valid logging level",
+    )
+    # alarm_sound_path is deliberately only checked for presence, not for
+    # existence on disk: Alarm.start() and main.VIOLATION_SOUNDS both already
+    # degrade gracefully on a missing file, so refusing to launch over a
+    # cosmetic sound would be worse than the problem.
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
@@ -76,12 +138,12 @@ def load_api_key(cfg: dict) -> str:
                 ["security", "find-generic-password", "-s", "pomodoro-guard-calendar", "-w"],
                 capture_output=True, text=True, check=True,
             )
-        except subprocess.CalledProcessError:
+        except subprocess.CalledProcessError as e:
             raise ConfigError(
                 "No API key found in Keychain under service 'pomodoro-guard-calendar'. "
                 "Run: security add-generic-password -a \"$USER\" "
                 "-s pomodoro-guard-calendar -w 'YOUR_KEY'"
-            )
+            ) from e
         key = out.stdout.strip()
         if not key:
             raise ConfigError("Keychain entry 'pomodoro-guard-calendar' is empty.")

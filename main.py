@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 import base64
 import fcntl
 import io
@@ -12,27 +13,45 @@ import traceback
 from dataclasses import asdict
 from pathlib import Path
 
-STATE = Path(__file__).parent / "state"
-STATE.mkdir(exist_ok=True)
-
-# ---------- single-instance guard (fixes I-15) -- before anything else ----------
-_lock_fh = open(STATE / "instance.lock", "w")
-try:
-    fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except OSError:
-    sys.exit("Argus is already running. Refusing to start a second instance.")
-_lock_fh.write(str(os.getpid()))
-_lock_fh.flush()
-
 import webview
 
+import alarm as alarm_mod
+import calendar_client
 import config as config_mod
 import ledger
 import outbox
-import alarm as alarm_mod
-import calendar_client
 import vision
 from timer import SessionTimer, State
+
+STATE = Path(__file__).parent / "state"
+STATE.mkdir(exist_ok=True)
+
+_lock_fh = None
+
+
+def _acquire_instance_lock() -> None:
+    """Single-instance guard (fixes I-15). Called first thing in main().
+
+    Deliberately a function rather than module-level code: at import time it
+    made main.py unimportable while the app was running, so none of this file
+    could be tested at all.
+    """
+    global _lock_fh
+    # Opened "a+", not "w": "w" truncates before flock is attempted, so a
+    # second instance would wipe the running instance's recorded PID on the
+    # way out.
+    # noqa justification: the handle must stay open for the process
+    # lifetime -- closing it releases the flock.
+    _lock_fh = open(STATE / "instance.lock", "a+")  # noqa: SIM115
+    try:
+        fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("Argus is already running. Refusing to start a second instance.")
+    _lock_fh.seek(0)
+    _lock_fh.truncate(0)
+    _lock_fh.write(str(os.getpid()))
+    _lock_fh.flush()
+
 
 log = logging.getLogger(__name__)
 
@@ -61,7 +80,13 @@ HEADLINES = {
 
 # States in which a session is over and the UI should be back to its resting
 # layout (main window visible, mini hidden, start enabled).
-TERMINAL_UI_STATES = (State.IDLE, State.LOGGING, State.FAILED, State.ABORTED, State.SUCCESS)
+TERMINAL_UI_STATES = (State.IDLE, State.LOGGING, State.FAILED, State.ABORTED)
+
+
+def _is_permanent_failure(exc: BaseException) -> bool:
+    """Failures no amount of retrying will fix -- rejected auth or a malformed
+    request. Everything else (timeouts, 5xx, DNS) is worth queueing for."""
+    return isinstance(exc, (calendar_client.CalendarClientError, config_mod.ConfigError))
 
 
 def _install_excepthooks() -> None:
@@ -103,6 +128,9 @@ class Engine:
         self.thumbnail_b64: str | None = None
         self._syncing = True
         self._stopping = False
+        # Result of a camera open already performed outside self.lock, waiting
+        # to be consumed by the next _open_camera() call. See _prewarm_camera.
+        self._camera_open_hint: bool | None = None
         # True from Start until the session reaches a terminal state. The JS
         # side watches this to decide when to show/hide the mini window, so
         # native window calls stay on pywebview's own threads.
@@ -135,7 +163,31 @@ class Engine:
 
     # ---------- camera / calibration callbacks ----------
     def _open_camera(self) -> bool:
+        """Called by SessionTimer while self.lock is held, so it must not
+        block. request_open() waits on the vision thread for up to 5s (the
+        AVFoundation open itself, plus a system_profiler probe on the very
+        first run), which would freeze snapshot() and therefore the UI. The
+        blocking wait is done ahead of time outside the lock and handed over
+        here; the fallback path only runs if no prewarm happened."""
+        hint, self._camera_open_hint = self._camera_open_hint, None
+        if hint is not None:
+            return hint
         return self.worker.request_open()
+
+    def _prewarm_camera(self) -> None:
+        """Perform the camera open for a due CAMERA_ERROR retry out here,
+        before _loop takes self.lock, so the _open_camera() call inside the
+        tick is instant. Reading timer state needs the lock only briefly."""
+        with self.lock:
+            due = (
+                self.timer.state == State.CAMERA_ERROR
+                and self.timer.camera_next_retry is not None
+                and time.monotonic() >= self.timer.camera_next_retry
+            )
+        if due:
+            opened = self.worker.request_open()
+            with self.lock:
+                self._camera_open_hint = opened
 
     def _close_camera(self) -> None:
         self.worker.request_close()
@@ -193,7 +245,7 @@ class Engine:
                 # send can never interleave POSTs for the same outbox.
                 with self._send_lock:
                     try:
-                        outbox.drain(self._send_to_calendar)
+                        outbox.drain(self._send_to_calendar, is_permanent=_is_permanent_failure)
                     except Exception as e:
                         log.warning("outbox drain error: %s", e)
 
@@ -208,6 +260,7 @@ class Engine:
         interval = self.cfg["check_interval_ms"] / 1000.0
         while not self._stopping:
             try:
+                self._prewarm_camera()
                 with self.lock:
                     reading = None
                     try:
@@ -262,23 +315,34 @@ class Engine:
         return f"Session failed: {outcome['reason']}"
 
     def _handle_logging(self) -> None:
-        session = self.timer.session
-        date, task = calendar_client.build_task(session, self.cfg["timezone"])
-        record = self.timer.build_record("success", None)
+        """Leaving LOGGING is unconditional. Anything raised in here used to
+        propagate to _loop's catch-all, which meant to_idle() never ran, the
+        state stayed LOGGING, and _handle_terminal_states re-entered every
+        500ms -- re-appending to the outbox each time, with Start disabled and
+        the mini window stuck open. The session is already finished by this
+        point; a reporting failure must not strand the app."""
+        try:
+            session = self.timer.session
+            date, task = calendar_client.build_task(session, self.cfg["timezone"])
+            record = self.timer.build_record("success", None)
 
-        if self.cfg["dry_run"]:
-            log.info("DRY RUN: would log session %s -> %s / %s", session.id, date, task)
-            self.status_message = f"Logged (dry run): {task['text']}"
-        else:
-            # Durable first: once this returns the session survives a crash,
-            # so the send itself is free to happen off this thread.
-            outbox.add({"date": date, "task": task})
-            self.status_message = "Logging to calendar…"
-            self._send_async(session.id, date, task)
+            if self.cfg["dry_run"]:
+                log.info("DRY RUN: would log session %s -> %s / %s", session.id, date, task)
+                self.status_message = f"Logged (dry run): {task['text']}"
+            else:
+                # Durable first: once this returns the session survives a
+                # crash, so the send itself is free to happen off this thread.
+                outbox.add({"date": date, "task": task})
+                self.status_message = "Logging to calendar…"
+                self._send_async(session.id, date, task)
 
-        ledger.record_session(record)
-        self.timer.to_idle()
-        self._end_session()
+            ledger.record_session(record)
+        except Exception:
+            log.exception("failed to record finished session")
+            self.status_message = "Session finished, but recording it failed — see logs/app.log."
+        finally:
+            self.timer.to_idle()
+            self._end_session()
 
     def _send_async(self, session_id: str, date: str, task: dict) -> None:
         """Hand the calendar POST to a background thread.
@@ -299,14 +363,19 @@ class Engine:
                     self._send_to_calendar(date, task)
                 except (calendar_client.CalendarClientError, config_mod.ConfigError) as e:
                     # Non-retryable: bad auth or bad request shape. Retrying
-                    # will never fix it, so say so rather than claiming it is
-                    # queued.
+                    # will never fix it, so drop it from the outbox rather than
+                    # leaving a poison entry that halts every later drain.
                     log.error("calendar rejected session %s: %s", session_id, e)
+                    outbox.remove(task["id"])
                     message, warning = "Saved locally but NOT logged to the calendar.", str(e)
                 except Exception as e:
                     log.warning("calendar send failed for %s, left in outbox: %s", session_id, e)
                     message, warning = "Queued — will retry syncing to calendar.", None
                 else:
+                    # Without this the entry survived a successful send and was
+                    # replayed on every subsequent launch, relying on the
+                    # server's dedupe to no-op it.
+                    outbox.remove(task["id"])
                     message, warning = f"Logged: {task['text']}", ""
 
             with self.lock:
@@ -319,13 +388,28 @@ class Engine:
     # ---------- JS-facing actions ----------
     def start(self, raw_label: str, minutes: float | None, look_down_enabled: bool,
               camera_enabled: bool, look_away_enabled: bool = False) -> dict:
+        # Open the camera before taking the lock: timer.start() calls
+        # _open_camera() from inside it, and blocking there would freeze the
+        # UI for the whole AVFoundation open right as the user hits Start.
+        hint = self.worker.request_open() if camera_enabled else None
         with self.lock:
+            self._camera_open_hint = hint
             try:
                 self.timer.start(raw_label, look_down_enabled, minutes=minutes,
                                  camera_enabled=camera_enabled,
                                  look_away_enabled=look_away_enabled)
             except (ValueError, RuntimeError) as e:
+                # The camera was opened above but no session took ownership of
+                # it -- don't leave the LED on after a rejected Start.
+                self._camera_open_hint = None
+                if camera_enabled:
+                    self.worker.request_close()
                 return {"error": str(e)}
+            # Record which detectors were unavailable for this run. Without
+            # this every ledger row said degraded=[] even when phone detection
+            # was off the whole session, so the log couldn't explain the run.
+            if self.timer.session is not None and camera_enabled:
+                self.timer.session.degraded = list(self.worker.degraded)
             self.status_message = ""
             self.session_active = True
         return {"ok": True}
@@ -448,7 +532,8 @@ class Engine:
         except Exception:
             pass
         try:
-            _lock_fh.close()
+            if _lock_fh is not None:
+                _lock_fh.close()
         except Exception:
             pass
 
@@ -498,6 +583,7 @@ class Api:
 
     def __init__(self):
         self._engine: Engine | None = None
+        self._boot_error: str | None = None
         self._main_window = None
         self._mini_window = None
         self._mini_visible = False
@@ -510,6 +596,9 @@ class Api:
 
     def _attach_engine(self, engine: Engine) -> None:
         self._engine = engine
+
+    def _set_boot_error(self, message: str) -> None:
+        self._boot_error = message
 
     # -- session control --
     def start(self, label: str, minutes, look_down: bool, camera: bool,
@@ -533,9 +622,19 @@ class Api:
         return {"ok": True} if self._engine is None else self._engine.false_positive()
 
     def get_state(self) -> dict:
-        if self._engine is None:
-            return dict(BOOTING_SNAPSHOT)
-        return self._engine.snapshot()
+        if self._engine is not None:
+            return self._engine.snapshot()
+        snapshot = dict(BOOTING_SNAPSHOT)
+        if self._boot_error is not None:
+            # Without this the UI sat on "Loading detection models…" with Start
+            # disabled forever, and the only trace was logs/app.log.
+            snapshot["headline"] = "failed to start"
+            snapshot["status_message"] = self._boot_error
+            snapshot["auth_warning"] = (
+                "Argus could not start. Fix the problem above and relaunch — "
+                "full traceback is in logs/app.log."
+            )
+        return snapshot
 
     # -- mini window --
     def enter_mini(self) -> dict:
@@ -572,6 +671,7 @@ class Api:
 
 
 def main() -> None:
+    _acquire_instance_lock()
     cfg = config_mod.load_config()
     ledger.setup_logging(cfg["log_level"])
     _install_excepthooks()
@@ -626,8 +726,9 @@ def main() -> None:
         t0 = time.monotonic()
         try:
             engine = Engine(cfg)
-        except Exception:
+        except Exception as e:
             log.exception("engine failed to start")
+            api._set_boot_error(f"Startup failed: {e.__class__.__name__}: {e}")
             return
         holder["engine"] = engine
         api._attach_engine(engine)
