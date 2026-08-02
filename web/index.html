@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Argus</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app">
+    <header class="topbar">
+      <span class="brand">argus</span>
+      <span class="clock" id="clock">--:--:--</span>
+    </header>
+
+    <section class="hero">
+      <div class="hero-text">
+        <div class="headline" id="headline">idle</div>
+        <div class="substate" id="substate"></div>
+      </div>
+      <div class="countdown" id="countdown">--:--</div>
+    </section>
+
+    <div class="progress-track">
+      <div class="progress-fill" id="progressFill"></div>
+    </div>
+
+    <section class="panel">
+      <div class="field-row">
+        <div class="field">
+          <label for="labelInput">label</label>
+          <input id="labelInput" type="text" placeholder="what are you working on?" autocomplete="off">
+        </div>
+        <div class="field field-narrow">
+          <label for="minutesInput">minutes</label>
+          <input id="minutesInput" type="number" min="1" value="25">
+        </div>
+      </div>
+
+      <div class="toggle-row">
+        <button id="lookDownToggle" class="toggle" data-on="false" type="button">
+          <span class="toggle-track"><span class="toggle-thumb"></span></span>
+          <span class="toggle-label">detect looking down (screen-only work)</span>
+        </button>
+      </div>
+    </section>
+
+    <section class="stats">
+      <div class="stat">
+        <span class="stat-label">camera</span>
+        <span class="stat-value" id="statCamera">not open</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">state</span>
+        <span class="stat-value" id="statState">idle</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">violations</span>
+        <span class="stat-value" id="statViolations">0</span>
+      </div>
+    </section>
+
+    <section class="camera-panel">
+      <div class="thumb" id="thumbWrap">
+        <img id="thumb" alt="camera preview">
+        <div class="thumb-placeholder" id="thumbPlaceholder">camera off</div>
+      </div>
+      <div class="camera-status">
+        <span class="stat-label">camera status</span>
+        <span id="cameraStatus" class="mono-small">not connected</span>
+      </div>
+    </section>
+
+    <section class="controls">
+      <button id="startBtn" class="btn btn-primary">start</button>
+      <button id="pauseBtn" class="btn btn-secondary" disabled>pause</button>
+      <button id="stopBtn" class="btn btn-secondary" disabled>stop</button>
+    </section>
+
+    <button id="falsePositiveBtn" class="link-btn" disabled>that was wrong — log for tuning</button>
+
+    <div class="messages">
+      <div id="statusMessage" class="status-message"></div>
+      <div id="degradedMessage" class="degraded-message"></div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
