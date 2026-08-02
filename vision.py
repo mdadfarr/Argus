@@ -308,22 +308,33 @@ class VisionWorker(threading.Thread):
                             self._open_result = False
                 self._open_done.set()
 
+            # The read MUST happen while holding _cap_lock. Grabbing the handle
+            # under the lock and then reading outside it leaves a window where
+            # request_close() can release the AVFoundation capture session
+            # while a frame grab is still in flight on it -- OpenCV's
+            # CaptureDelegate then messages freed memory and the whole process
+            # segfaults (objc_msgSend on a dangling pointer). That is exactly
+            # what killed the first session that ever ran to completion.
             with self._cap_lock:
                 cap = self.cap
-            if cap is None:
+                if cap is None:
+                    reading = None
+                else:
+                    reading = self._read_once(cap)
+                    if not reading.ok:
+                        # Release on any read failure so the next
+                        # request_open() call (driven by timer.py's backoff
+                        # schedule) actually attempts a fresh open instead of
+                        # trivially reporting success against a stale, broken
+                        # capture handle.
+                        if self.cap is not None:
+                            self.cap.release()
+                            self.cap = None
+
+            if reading is None:
                 time.sleep(0.05)
                 continue
-
-            reading = self._read_once(cap)
             if not reading.ok:
-                # Release on any read failure so the next request_open() call
-                # (driven by timer.py's backoff schedule) actually attempts a
-                # fresh open instead of trivially reporting success against a
-                # stale, broken capture handle.
-                with self._cap_lock:
-                    if self.cap is not None:
-                        self.cap.release()
-                        self.cap = None
                 time.sleep(0.1)
             self._push(reading)
 

@@ -63,6 +63,12 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
 
 
 def load_api_key(cfg: dict) -> str:
+    """Raises ConfigError if no key is available.
+
+    Deliberately does NOT call sys.exit(): this runs on background threads
+    (outbox drain, calendar send), where SystemExit is silently swallowed by
+    the threading machinery and the real problem never reaches the user.
+    """
     source = cfg["calendar_api_key_source"]
     if source == "keychain":
         try:
@@ -71,13 +77,17 @@ def load_api_key(cfg: dict) -> str:
                 capture_output=True, text=True, check=True,
             )
         except subprocess.CalledProcessError:
-            sys.exit(
+            raise ConfigError(
                 "No API key found in Keychain under service 'pomodoro-guard-calendar'. "
-                "Run: security add-generic-password -a \"$USER\" -s pomodoro-guard-calendar -w 'YOUR_KEY'"
+                "Run: security add-generic-password -a \"$USER\" "
+                "-s pomodoro-guard-calendar -w 'YOUR_KEY'"
             )
-        return out.stdout.strip()
+        key = out.stdout.strip()
+        if not key:
+            raise ConfigError("Keychain entry 'pomodoro-guard-calendar' is empty.")
+        return key
 
     key = cfg.get("calendar_api_key")
     if not key:
-        sys.exit("calendar_api_key_source is 'config' but calendar_api_key is empty")
+        raise ConfigError("calendar_api_key_source is 'config' but calendar_api_key is empty")
     return key

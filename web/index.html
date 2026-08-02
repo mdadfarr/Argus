@@ -8,80 +8,90 @@
 <body>
   <div class="app">
     <header class="topbar">
-      <span class="brand">argus</span>
+      <span class="brand">Argus</span>
       <span class="clock" id="clock">--:--:--</span>
     </header>
 
+    <div class="banner" id="authBanner"></div>
+    <div class="banner" id="degradedBanner"></div>
+
     <section class="hero">
-      <div class="hero-text">
-        <div class="headline" id="headline">idle</div>
-        <div class="substate" id="substate"></div>
-      </div>
+      <div class="headline" id="headline">idle</div>
       <div class="countdown" id="countdown">--:--</div>
     </section>
 
-    <div class="progress-track">
-      <div class="progress-fill" id="progressFill"></div>
-    </div>
+    <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
 
-    <section class="panel">
+    <section class="band">
       <div class="field-row">
         <div class="field">
-          <label for="labelInput">label</label>
+          <label class="label" for="labelInput">Label</label>
           <input id="labelInput" type="text" placeholder="what are you working on?" autocomplete="off">
         </div>
         <div class="field field-narrow">
-          <label for="minutesInput">minutes</label>
+          <label class="label" for="minutesInput">Minutes</label>
           <input id="minutesInput" type="number" min="1" value="25">
         </div>
       </div>
+    </section>
 
-      <div class="toggle-row">
-        <button id="lookDownToggle" class="toggle" data-on="false" type="button">
-          <span class="toggle-track"><span class="toggle-thumb"></span></span>
-          <span class="toggle-label">detect looking down (screen-only work)</span>
+    <section class="band">
+      <div class="toggles">
+        <button id="cameraToggle" class="check" data-on="true" type="button">
+          <span class="check-box"></span>
+          <span>
+            <span class="check-text">Camera detection</span>
+            <span class="check-note">Off = timer only. Nothing opens the camera, so no Edge Light.</span>
+          </span>
+        </button>
+        <button id="lookDownToggle" class="check" data-on="false" type="button">
+          <span class="check-box"></span>
+          <span>
+            <span class="check-text">Detect looking down</span>
+            <span class="check-note">For screen-only work. Needs the camera on.</span>
+          </span>
         </button>
       </div>
     </section>
 
-    <section class="stats">
-      <div class="stat">
-        <span class="stat-label">camera</span>
-        <span class="stat-value" id="statCamera">not open</span>
-      </div>
-      <div class="stat">
-        <span class="stat-label">state</span>
-        <span class="stat-value" id="statState">idle</span>
-      </div>
-      <div class="stat">
-        <span class="stat-label">violations</span>
-        <span class="stat-value" id="statViolations">0</span>
+    <section class="band">
+      <div class="stats">
+        <div class="stat">
+          <span class="label">State</span>
+          <span class="stat-value" id="statState">idle</span>
+        </div>
+        <div class="stat">
+          <span class="label">Violations</span>
+          <span class="stat-value" id="statViolations">0</span>
+        </div>
+        <div class="stat">
+          <span class="label">Camera</span>
+          <span class="stat-value" id="statCamera">not open</span>
+        </div>
       </div>
     </section>
 
-    <section class="camera-panel">
-      <div class="thumb" id="thumbWrap">
+    <section class="band camera-band">
+      <div class="thumb">
         <img id="thumb" alt="camera preview">
-        <div class="thumb-placeholder" id="thumbPlaceholder">camera off</div>
+        <div class="thumb-placeholder" id="thumbPlaceholder">no signal</div>
       </div>
-      <div class="camera-status">
-        <span class="stat-label">camera status</span>
+      <div class="camera-meta">
+        <span class="label">Camera status</span>
         <span id="cameraStatus" class="mono-small">not connected</span>
       </div>
     </section>
 
-    <section class="controls">
-      <button id="startBtn" class="btn btn-primary">start</button>
-      <button id="pauseBtn" class="btn btn-secondary" disabled>pause</button>
-      <button id="stopBtn" class="btn btn-secondary" disabled>stop</button>
+    <section class="band" style="border-bottom:none">
+      <div class="controls">
+        <button id="startBtn" class="btn btn-primary">Start</button>
+        <button id="pauseBtn" class="btn btn-secondary" disabled>Pause</button>
+        <button id="stopBtn" class="btn btn-secondary" disabled>Stop</button>
+      </div>
+      <button id="falsePositiveBtn" class="link-btn" disabled>that was wrong — log for tuning</button>
     </section>
 
-    <button id="falsePositiveBtn" class="link-btn" disabled>that was wrong — log for tuning</button>
-
-    <div class="messages">
-      <div id="statusMessage" class="status-message"></div>
-      <div id="degradedMessage" class="degraded-message"></div>
-    </div>
+    <div class="status" id="statusMessage"></div>
   </div>
 
   <script src="app.js"></script>

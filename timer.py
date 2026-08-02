@@ -49,6 +49,7 @@ class Session:
     started_wall_iso: str
     started_mono: float
     look_down_enabled: bool = False
+    camera_enabled: bool = True
     focus_elapsed_s: float = 0.0
     paused_total_s: float = 0.0
     manual_paused_s: float = 0.0
@@ -131,7 +132,8 @@ class SessionTimer:
         CHECKPOINT_PATH.unlink(missing_ok=True)
 
     # ---------- start / manual pause ----------
-    def start(self, raw_label: str, look_down_enabled: bool, minutes: float | None = None):
+    def start(self, raw_label: str, look_down_enabled: bool, minutes: float | None = None,
+              camera_enabled: bool = True):
         if self.state != State.IDLE:
             raise RuntimeError(f"cannot start from state {self.state}")
         label = clean_label(raw_label)
@@ -146,7 +148,8 @@ class SessionTimer:
             duration_s=minutes * 60,
             started_wall_iso=datetime.now(ZoneInfo(self.cfg["timezone"])).isoformat(),
             started_mono=now_mono,
-            look_down_enabled=look_down_enabled,
+            look_down_enabled=look_down_enabled and camera_enabled,
+            camera_enabled=camera_enabled,
         )
         self.last_tick = now_mono
         self._look_down_state = False
@@ -154,6 +157,14 @@ class SessionTimer:
         self.phone_cond.reset()
         self.look_down_cond.reset()
         self.camera_backoff_idx = 0
+
+        if not camera_enabled:
+            # Timer-only mode: the camera is never opened, so there is nothing
+            # to calibrate against and no violation can ever fire. Go straight
+            # to RUNNING.
+            self.state = State.RUNNING
+            self._checkpoint()
+            return
 
         if self._on_camera_open:
             self._on_camera_open()
@@ -188,6 +199,11 @@ class SessionTimer:
         if self.state != State.INTERRUPTED:
             return
         now = time.monotonic()
+        if self.session is not None and not self.session.camera_enabled:
+            self.state = State.RUNNING
+            self.last_tick = now
+            self._checkpoint()
+            return
         self.state = State.CALIBRATING
         self.calibration_deadline = now + self.cfg["calibration_seconds"]
         if self._on_calibrate_start:
@@ -255,6 +271,13 @@ class SessionTimer:
     def _tick_running(self, now, dt, reading):
         self.session.focus_elapsed_s += dt
         self._checkpoint()
+
+        if not self.session.camera_enabled:
+            # No camera => no readings will ever arrive, so completion has to
+            # be checked here rather than in the violation branch below.
+            if self.session.focus_elapsed_s >= self.session.duration_s:
+                self._succeed()
+            return
 
         if reading is None:
             return
@@ -429,4 +452,5 @@ class SessionTimer:
             "manual_pauses": s.manual_pauses,
             "degraded": s.degraded,
             "look_down_enabled": s.look_down_enabled,
+            "camera_enabled": s.camera_enabled,
         }
