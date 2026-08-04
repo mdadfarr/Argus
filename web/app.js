@@ -18,6 +18,7 @@
   const thumb = el('thumb');
   const thumbPlaceholder = el('thumbPlaceholder');
   const cameraStatus = el('cameraStatus');
+  const backToMiniBtn = el('backToMiniBtn');
   const startBtn = el('startBtn');
   const pauseBtn = el('pauseBtn');
   const stopBtn = el('stopBtn');
@@ -108,6 +109,12 @@
     }
   });
 
+  backToMiniBtn.addEventListener('click', async () => {
+    if (!apiReady) return;
+    await window.pywebview.api.enter_mini();
+    miniShown = true;
+  });
+
   pauseBtn.addEventListener('click', () => {
     if (apiReady) window.pywebview.api.pause_resume();
   });
@@ -176,6 +183,10 @@
       miniShown = false;
       if (apiReady) window.pywebview.api.exit_mini();
     }
+
+    // Only reachable mid-session by double-clicking the popup, so the only
+    // way back to it otherwise was quitting the session entirely.
+    backToMiniBtn.style.display = s.session_active ? 'inline' : 'none';
   }
 
   async function poll() {

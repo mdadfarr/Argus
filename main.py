@@ -13,7 +13,9 @@ import traceback
 from dataclasses import asdict
 from pathlib import Path
 
+import AppKit
 import webview
+from PyObjCTools import AppHelper
 
 import alarm as alarm_mod
 import calendar_client
@@ -643,17 +645,65 @@ class Api:
                 return {"ok": True}
             try:
                 self._mini_window.show()
-                try:
-                    screen = webview.screens[0]
-                    self._mini_window.move(screen.width - 240, 60)
-                except Exception as e:
-                    log.debug("mini window positioning failed: %s", e)
+                self._reposition_mini()
                 if self._main_window is not None:
                     self._main_window.hide()
                 self._mini_visible = True
             except Exception:
                 log.exception("failed to enter mini mode")
         return {"ok": True}
+
+    def _reposition_mini(self) -> None:
+        """Put the mini window at the top-right of whatever screen the main
+        window is actually on.
+
+        pywebview's cocoa backend records each window's "screen" once, at
+        create_window() time, and never updates it (see BrowserView.__init__
+        and .move() / .get_position() / the easy_drag clamp in cocoa.py --
+        all of them read that frozen value). Both windows are created before
+        we know which monitor the user is on, so it defaults to the primary
+        display. On a two-monitor Mac that made the popup spawn using the
+        wrong screen's origin/height (half off-screen) and made dragging it
+        clamp against the *primary* screen's bottom edge even while the
+        window physically sat on the other display.
+
+        Fix: look up the screen the main window's NSWindow is currently
+        displayed on (AppKit tracks this live, unlike pywebview's cached
+        copy), correct the frozen value pywebview stored for the mini
+        window, and position it with raw AppKit coordinates so the
+        placement math can't be wrong a second time. All of this must run on
+        the main thread via AppHelper.callAfter -- this method is invoked
+        from a pywebview JS-bridge thread, and every other window operation
+        in the cocoa backend (show/hide/move/resize) marshals the same way;
+        calling AppKit directly from here hangs enter_mini(), which the JS
+        Start handler awaits, so the fix would silently break Start.
+        """
+        try:
+            from webview.platforms.cocoa import BrowserView
+            main_inst = BrowserView.instances.get(self._main_window.uid)
+            mini_inst = BrowserView.instances.get(self._mini_window.uid)
+            if main_inst is None or mini_inst is None:
+                return
+
+            def _apply():
+                try:
+                    screen = main_inst.window.screen() or AppKit.NSScreen.mainScreen()
+                    frame = screen.frame()
+                    mini_inst.screen = frame  # un-stales pywebview's cached screen
+
+                    size = mini_inst.window.frame().size
+                    margin = 24
+                    x = frame.origin.x + frame.size.width - size.width - margin
+                    y = frame.origin.y + frame.size.height - size.height - margin
+                    x = max(frame.origin.x, min(x, frame.origin.x + frame.size.width - size.width))
+                    y = max(frame.origin.y, min(y, frame.origin.y + frame.size.height - size.height))
+                    mini_inst.window.setFrameOrigin_(AppKit.NSMakePoint(x, y))
+                except Exception as e:
+                    log.debug("mini window positioning failed: %s", e)
+
+            AppHelper.callAfter(_apply)
+        except Exception as e:
+            log.debug("mini window positioning failed: %s", e)
 
     def exit_mini(self) -> dict:
         with self._mini_lock:
@@ -704,19 +754,42 @@ def main() -> None:
     )
     api._attach_windows(main_window, mini_window)
 
-    closing = threading.Event()
+    def hide_on_close():
+        # Clicking the red traffic-light button used to destroy main_window
+        # outright (pywebview drops the closed window from BrowserView.
+        # instances), and nothing in the app could show it again short of
+        # relaunching. Cancel the native close and just hide instead, same
+        # as the mini window -- the dock-icon handler below brings it back.
+        main_window.hide()
+        return False
 
-    def on_closing():
-        if closing.is_set():
-            return
-        closing.set()
+    main_window.events.closing += hide_on_close
+
+    # Cmd+Q / Dock > Quit route through AppDelegate.applicationShouldTerminate_,
+    # which also fires main_window's closing event but ignores hide_on_close's
+    # return value and always terminates -- so a real quit still reaches here
+    # via webview.start() returning, distinct from a cancelled red-X click.
+    def shutdown():
         engine = holder.get("engine")
         if engine is not None:
             engine.shutdown()
         else:
             log.info("Argus shutting down (before engine was ready)")
 
-    main_window.events.closing += on_closing
+    def reopen_on_dock_click(self, sender, has_visible_windows):
+        try:
+            main_window.show()
+        except Exception:
+            log.exception("failed to reopen window from dock click")
+        return True
+
+    try:
+        from webview.platforms.cocoa import BrowserView
+        BrowserView.AppDelegate.applicationShouldHandleReopen_hasVisibleWindows_ = (
+            reopen_on_dock_click
+        )
+    except Exception:
+        log.debug("could not install dock reopen handler", exc_info=True)
 
     def boot():
         """Building the Engine loads the MediaPipe models, which takes several
@@ -737,7 +810,7 @@ def main() -> None:
     threading.Thread(target=boot, name="argus-boot", daemon=True).start()
 
     webview.start()
-    on_closing()
+    shutdown()
 
 
 if __name__ == "__main__":
