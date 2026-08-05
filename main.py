@@ -472,7 +472,12 @@ class Engine:
                 )
             elif state == State.INTERRUPTED:
                 pause_remaining_s = max(0.0, self.timer.manual_pause_deadline - time.monotonic())
-                countdown = f"paused {int(pause_remaining_s // 60):02d}:{int(pause_remaining_s % 60):02d}"
+                countdown = f"{int(pause_remaining_s // 60):02d}:{int(pause_remaining_s % 60):02d}"
+                max_pause_s = self.cfg["max_manual_pause_seconds"]
+                progress_frac = (
+                    0.0 if max_pause_s <= 0
+                    else max(0.0, min(1.0, 1.0 - (pause_remaining_s / max_pause_s)))
+                )
 
             camera_on = session is not None and session.camera_enabled
             if session is not None and not session.camera_enabled:

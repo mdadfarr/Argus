@@ -8,6 +8,7 @@
     --bg: #0B0B0B;
     --ink: #FAFAFA;
     --accent: #E8231A;
+    --pause: #E8A100;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -54,10 +55,29 @@
   body.violation .wrap { background: var(--accent); border-color: var(--accent); }
   body.violation .time { color: #FFFFFF; }
   body.violation .fill { background: #FFFFFF; }
+
+  /* Paused: distinct from both the resting (black) and violation (red) looks,
+     so a glance at the popup alone tells the user which state they're in. */
+  body.paused .wrap { border-color: var(--pause); }
+  body.paused .time { color: var(--pause); }
+  body.paused .fill { background: var(--pause); }
+  body.paused .badge { display: block; }
+
+  .badge {
+    display: none;
+    position: absolute;
+    top: 6px; left: 0; right: 0;
+    text-align: center;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    color: var(--pause);
+  }
 </style>
 </head>
 <body>
   <div class="wrap">
+    <div class="badge">PAUSED</div>
     <div class="time" id="miniTime">--:--</div>
     <div class="bar"><div class="fill" id="miniFill"></div></div>
   </div>
@@ -84,6 +104,7 @@
           fillEl.style.width =
             `${Math.max(0, Math.min(1, s.progress_frac || 0)) * 100}%`;
           document.body.classList.toggle('violation', !!s.in_violation);
+          document.body.classList.toggle('paused', s.state === 'INTERRUPTED');
           if (s.session_active) {
             sawSession = true;
           } else if (sawSession) {
