@@ -462,6 +462,7 @@ class Engine:
 
             countdown = ""
             progress_frac = 0.0
+            pause_remaining_s = None
             if session is not None and state in (State.RUNNING, State.VIOLATION_GRACE, State.CALIBRATING):
                 remaining = session.remaining_s
                 countdown = f"{int(remaining // 60):02d}:{int(remaining % 60):02d}"
@@ -470,7 +471,8 @@ class Engine:
                     else max(0.0, min(1.0, 1.0 - (remaining / session.duration_s)))
                 )
             elif state == State.INTERRUPTED:
-                countdown = "paused"
+                pause_remaining_s = max(0.0, self.timer.manual_pause_deadline - time.monotonic())
+                countdown = f"paused {int(pause_remaining_s // 60):02d}:{int(pause_remaining_s % 60):02d}"
 
             camera_on = session is not None and session.camera_enabled
             if session is not None and not session.camera_enabled:
@@ -484,6 +486,11 @@ class Engine:
                 status_message = f"Violation: {self.timer.grace_kind}. Return to resolve."
             elif state == State.CAMERA_ERROR:
                 status_message = "Camera unavailable — retrying…"
+            elif state == State.INTERRUPTED:
+                status_message = (
+                    f"Paused — resume within {int(pause_remaining_s // 60):02d}:"
+                    f"{int(pause_remaining_s % 60):02d} or session fails."
+                )
             else:
                 status_message = self.status_message
 
