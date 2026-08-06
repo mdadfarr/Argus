@@ -12,6 +12,7 @@
   }
   * { box-sizing: border-box; }
   html, body {
+    position: relative;
     margin: 0; padding: 0; height: 100%; width: 100%;
     background: transparent; color: var(--ink);
     font-family: "Helvetica Neue", Inter, -apple-system, system-ui, Arial, sans-serif;
@@ -20,16 +21,51 @@
     user-select: none; -webkit-user-select: none;
     overflow: hidden;
   }
-  /* One box, nothing in it but the time. The progress bar is flush to the
-     bottom edge so it reads as part of the frame rather than as content. */
+  /* macOS draws window corners as a continuous-curvature squircle, not a
+     circular arc -- border-radius alone renders visibly wrong (too round
+     through the middle, wrong tangent). SQUIRCLE_PATH below is a fixed
+     168x68 superellipse (|x/10|^5 + |y/10|^5 = 1 corners, r=10) computed
+     once for this window's exact, non-resizable size. Both the clip on
+     .wrap and the stroke in .stroke below MUST use this identical path --
+     it's the single source of the shape, not two independently-drawn
+     rectangles. If the mini window's width/height ever change, regenerate
+     this path for the new dimensions. */
+  :root {
+    --squircle-path: path("M10,0 L158,0 L163.2,0.08 L164.81,0.31 L165.9,0.71 L166.71,1.29 L167.29,2.1 L167.69,3.19 L167.92,4.8 L168,10 L168,58 L167.92,63.2 L167.69,64.81 L167.29,65.9 L166.71,66.71 L165.9,67.29 L164.81,67.69 L163.2,67.92 L158,68 L10,68 L4.8,67.92 L3.19,67.69 L2.1,67.29 L1.29,66.71 L0.71,65.9 L0.31,64.81 L0.08,63.2 L0,58 L0,10 L0.08,4.8 L0.31,3.19 L0.71,2.1 L1.29,1.29 L2.1,0.71 L3.19,0.31 L4.8,0.08 Z");
+  }
   .wrap {
     position: relative;
     height: 100%; width: 100%;
     background: var(--bg);
-    border: 1px solid #2E2E2E;
+    clip-path: var(--squircle-path);
     display: flex;
     align-items: center;
     justify-content: center;
+  }
+  /* Stroke lives in its own unclipped SVG layer, sized to the same 168x68
+     box, so the stroke's outer half is never cut by .wrap's clip-path --
+     that clipping-of-the-stroke-by-its-own-parent was the earlier bug. */
+  .stroke {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+  .stroke path {
+    fill: none;
+    stroke: #2E2E2E;
+    stroke-width: 1px;
+  }
+  /* Chromium 130+ can draw the squircle natively; when it can, skip the
+     clip-path/SVG workaround entirely and let a real border do it. */
+  @supports (corner-shape: squircle) or (-webkit-corner-shape: squircle) {
+    .wrap {
+      clip-path: none;
+      border: 1px solid #2E2E2E;
+      border-radius: 10px;
+      corner-shape: squircle;
+      -webkit-corner-shape: squircle;
+    }
+    .stroke { display: none; }
   }
   .time {
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
@@ -41,24 +77,31 @@
     /* nudge up by half the bar so the number is optically centred in the box */
     transform: translateY(-1px);
   }
+  /* Progress pill: inset well clear of the corner radius so it never
+     overlaps or reads as part of the border stroke above. */
   .bar {
     position: absolute;
-    left: 0; right: 0; bottom: 0;
+    left: 6px; right: 6px; bottom: 5px;
     height: 3px;
+    border-radius: 1.5px;
+    overflow: hidden;
   }
   .fill {
     height: 100%; width: 0%;
+    border-radius: inherit;
     background: var(--accent);
     transition: width 0.4s linear;
   }
 
   body.violation .wrap { background: var(--accent); border-color: var(--accent); }
+  body.violation .stroke path { stroke: var(--accent); }
   body.violation .time { color: #FFFFFF; }
   body.violation .fill { background: #FFFFFF; }
 
   /* Paused: distinct from both the resting (black) and violation (red) looks,
      so a glance at the popup alone tells the user which state they're in. */
   body.paused .wrap { border-color: var(--pause); }
+  body.paused .stroke path { stroke: var(--pause); }
   body.paused .time { color: var(--pause); }
   body.paused .fill { background: var(--pause); }
   body.paused .badge { display: block; }
@@ -81,6 +124,9 @@
     <div class="time" id="miniTime">--:--</div>
     <div class="bar"><div class="fill" id="miniFill"></div></div>
   </div>
+  <svg class="stroke" width="168" height="68" viewBox="0 0 168 68">
+    <path d="M10,0 L158,0 L163.2,0.08 L164.81,0.31 L165.9,0.71 L166.71,1.29 L167.29,2.1 L167.69,3.19 L167.92,4.8 L168,10 L168,58 L167.92,63.2 L167.69,64.81 L167.29,65.9 L166.71,66.71 L165.9,67.29 L164.81,67.69 L163.2,67.92 L158,68 L10,68 L4.8,67.92 L3.19,67.69 L2.1,67.29 L1.29,66.71 L0.71,65.9 L0.31,64.81 L0.08,63.2 L0,58 L0,10 L0.08,4.8 L0.31,3.19 L0.71,2.1 L1.29,1.29 L2.1,0.71 L3.19,0.31 L4.8,0.08 Z"/>
+  </svg>
 
 <script>
 (() => {

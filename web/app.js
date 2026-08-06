@@ -6,6 +6,10 @@
   const countdownEl = el('countdown');
   const progressFillEl = el('progressFill');
   const labelInput = el('labelInput');
+  labelInput.addEventListener('input', () => {
+    labelInput.classList.remove('error');
+    statusMessage.classList.remove('error');
+  });
   const minutesInput = el('minutesInput');
   const cameraToggle = el('cameraToggle');
   const lookDownToggle = el('lookDownToggle');
@@ -91,6 +95,13 @@
 
   startBtn.addEventListener('click', async () => {
     if (!apiReady) return;
+    if (!labelInput.value.trim()) {
+      statusMessage.textContent = 'Label is required.';
+      statusMessage.classList.add('error');
+      labelInput.classList.add('error');
+      labelInput.focus();
+      return;
+    }
     const minutes = parseFloat(minutesInput.value);
     startBtn.disabled = true;
     try {
@@ -99,9 +110,12 @@
       );
       if (res && res.error) {
         statusMessage.textContent = res.error;
+        statusMessage.classList.add('error');
         startBtn.disabled = false;
         return;
       }
+      statusMessage.classList.remove('error');
+      labelInput.classList.remove('error');
       await window.pywebview.api.enter_mini();
       miniShown = true;
     } catch (e) {
