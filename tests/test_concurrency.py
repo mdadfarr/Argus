@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import threading
 import time
+import traceback
 
 import main
 from timer import SessionTimer, State
@@ -40,6 +41,10 @@ def _bare_engine(cfg):
     e._syncing = False
     e._stopping = False
     e.session_active = False
+    # Must mirror Engine.__init__: snapshot() reads self.focus on every poll,
+    # and a missing attribute here surfaces only as the poller thread dying.
+    e.focus = None
+    e._focus_handoff = None
     return e
 
 
@@ -61,19 +66,32 @@ class _FakeWorker:
 
 
 def _poll_while(engine, done, out):
-    """Stands in for web/app.js calling get_state() on a loop."""
+    """Stands in for web/app.js calling get_state() on a loop.
+
+    Everything is recorded through `out` because this runs on its own thread,
+    where an exception is otherwise invisible: the thread dies, `out` stays
+    empty, and the assertion below fails as a bare KeyError naming neither the
+    real error nor this function. Capturing it turns that into the traceback.
+    """
     worst = 0.0
     polls = 0
-    while not done.is_set() or polls < 3:
-        t0 = time.monotonic()
-        engine.snapshot()
-        worst = max(worst, time.monotonic() - t0)
-        polls += 1
-        time.sleep(0.01)
-        if polls > 5000:
-            break
+    try:
+        while not done.is_set() or polls < 3:
+            t0 = time.monotonic()
+            engine.snapshot()
+            worst = max(worst, time.monotonic() - t0)
+            polls += 1
+            time.sleep(0.01)
+            if polls > 5000:
+                break
+    except Exception:
+        out["error"] = traceback.format_exc()
     out["worst"] = worst
     out["polls"] = polls
+
+
+def _check_poller(out):
+    assert "error" not in out, f"snapshot() raised on the polling thread:\n{out['error']}"
 
 
 def test_slow_calendar_send_does_not_block_the_ui(cfg, isolated_state, monkeypatch):
@@ -122,6 +140,7 @@ def test_slow_calendar_send_does_not_block_the_ui(cfg, isolated_state, monkeypat
     ticker.join()
     poller.join()
 
+    _check_poller(out)
     assert out["worst"] < MAX_ACCEPTABLE_BLOCK_S, (
         f"snapshot() blocked for {out['worst']:.2f}s during a "
         f"{SLOW_OP_S}s calendar send"
@@ -159,6 +178,7 @@ def test_slow_camera_open_does_not_block_the_ui(cfg, isolated_state, monkeypatch
     presser.join()
     poller.join()
 
+    _check_poller(out)
     assert out["worst"] < MAX_ACCEPTABLE_BLOCK_S, (
         f"snapshot() blocked for {out['worst']:.2f}s during a "
         f"{SLOW_OP_S}s camera open"
