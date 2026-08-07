@@ -233,6 +233,7 @@ button, input { font-family: inherit; border-radius: 0; }
 
 /* ---------- controls ---------- */
 .controls { display: flex; gap: 12px; }
+.focus-row { display: flex; gap: 12px; margin: 9px 0 7px; }
 .btn {
   flex: 1;
   padding: 13px 12px;

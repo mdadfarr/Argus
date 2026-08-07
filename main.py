@@ -20,6 +20,7 @@ from PyObjCTools import AppHelper
 import alarm as alarm_mod
 import calendar_client
 import config as config_mod
+import focus as focus_mod
 import ledger
 import outbox
 import vision
@@ -137,6 +138,12 @@ class Engine:
         # side watches this to decide when to show/hide the mini window, so
         # native window calls stay on pywebview's own threads.
         self.session_active = False
+        # Focus mode (black screens, no clock). Runs instead of a session, not
+        # alongside one -- focus_start() refuses unless the timer is IDLE.
+        self.focus: focus_mod.FocusSession | None = None
+        # Settings captured at focus_start, replayed into the pomodoro that
+        # auto-starts when the block ends.
+        self._focus_handoff: dict | None = None
 
         self.reading_queue: queue.Queue = queue.Queue(maxsize=2)
         self.preview_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -274,6 +281,7 @@ class Engine:
                         self.latest_reading = reading
 
                     self.timer.tick(reading)
+                    self._tick_focus(reading)
                     self._update_thumbnail()
                     self._handle_terminal_states()
             except Exception:
@@ -436,6 +444,111 @@ class Engine:
                 self.status_message = "Logged current readings for later threshold tuning."
         return {"ok": True}
 
+    # ---------- focus mode ----------
+    def focus_start(self, raw_label: str, minutes, look_down_enabled: bool,
+                    look_away_enabled: bool) -> dict:
+        """look_down_enabled/look_away_enabled apply to the pomodoro that
+        follows, not to the block itself: focus mode always watches for both,
+        and always needs the camera, whatever the toggles say. A block whose
+        head-movement detection could be switched off is just a black screen.
+        """
+        label = (raw_label or "").strip()
+        if not label:
+            return {"error": "Label is required."}
+        try:
+            m = int(minutes)
+        except (TypeError, ValueError):
+            m = None
+        if m not in focus_mod.FOCUS_MINUTES_CHOICES:
+            choices = "/".join(str(c) for c in focus_mod.FOCUS_MINUTES_CHOICES)
+            return {"error": f"Focus length must be one of {choices} minutes."}
+
+        with self.lock:
+            if self.focus is not None:
+                return {"error": "A focus block is already running."}
+            if self.timer.state != State.IDLE:
+                return {"error": "Finish the current session before starting focus."}
+
+        # Outside the lock for the same reason Engine.start() does it: the
+        # AVFoundation open blocks for up to 5s, and holding self.lock through
+        # it freezes snapshot() and therefore the whole UI.
+        if not self.worker.request_open():
+            return {"error": "Camera unavailable — focus mode needs the camera."}
+
+        with self.lock:
+            self.worker.start_calibration()
+            self.focus = focus_mod.FocusSession(self.cfg, label, m, time.monotonic())
+            self._focus_handoff = {
+                "label": label,
+                "look_down": bool(look_down_enabled),
+                "look_away": bool(look_away_enabled),
+            }
+            self.status_message = ""
+        log.info("focus block started: %d min", m)
+        return {"ok": True}
+
+    def focus_cancel(self) -> dict:
+        """Ends the block early without starting the pomodoro. Reached only by
+        the hidden Esc hold in the black windows."""
+        with self.lock:
+            if self.focus is not None:
+                self.focus.cancel()
+                log.info("focus block cancelled by user")
+        return {"ok": True}
+
+    def focus_snapshot(self) -> dict:
+        with self.lock:
+            if self.focus is None:
+                return dict(focus_mod.IDLE_SNAPSHOT)
+            return self.focus.snapshot()
+
+    def _tick_focus(self, reading) -> None:
+        """Called from _loop with self.lock held."""
+        session = self.focus
+        if session is None:
+            return
+
+        was_calibrating = session.state == focus_mod.FocusState.CALIBRATING
+        session.tick(reading, time.monotonic())
+
+        if was_calibrating and session.state == focus_mod.FocusState.RUNNING:
+            self.worker.finish_calibration()
+
+        if session.violation_started is not None:
+            self._on_alarm_start(session.violation_started)
+
+        if session.state == focus_mod.FocusState.DONE:
+            self._finish_focus(start_pomodoro=True)
+        elif session.state == focus_mod.FocusState.CANCELLED:
+            self._finish_focus(start_pomodoro=False)
+
+    def _finish_focus(self, start_pomodoro: bool) -> None:
+        """Tear down the block. Runs under self.lock, from the tick thread.
+
+        The black windows are NOT closed here -- they are native windows owned
+        by Api, and driving them from this thread is the class of bug that
+        caused the camera segfault. The main window's poll sees focus_active
+        go false and calls Api.focus_exit() from a pywebview thread instead.
+        """
+        handoff, self._focus_handoff = self._focus_handoff or {}, None
+        self.focus = None
+
+        if not start_pomodoro:
+            self.worker.request_close()
+            self.status_message = "Focus block ended early."
+            return
+
+        self.alarm.start()  # cfg's alarm_sound_path -- the block is over
+        # start() re-opens (a no-op, the camera is already ours) and kicks off
+        # a fresh calibration for the session proper.
+        result = self.start(handoff.get("label", ""), self.cfg["pomodoro_minutes"],
+                            handoff.get("look_down", False), True,
+                            handoff.get("look_away", False))
+        if result.get("error"):
+            log.error("focus handoff to pomodoro failed: %s", result["error"])
+            self.worker.request_close()
+            self.status_message = f"Focus done, but the session did not start: {result['error']}"
+
     def _diagnostics(self, camera_on: bool) -> dict:
         """Live detector output, surfaced so thresholds can be tuned against
         real numbers instead of guesswork."""
@@ -514,6 +627,9 @@ class Engine:
                 "camera_on": camera_on,
                 "state": state.value,
                 "session_active": self.session_active,
+                # Drives teardown of the black focus windows from the main
+                # window's poll -- see _finish_focus for why not from here.
+                "focus_active": self.focus is not None,
                 "in_violation": state == State.VIOLATION_GRACE,
                 "violations": session.violations if session is not None else 0,
                 "status_message": status_message,
@@ -524,7 +640,9 @@ class Engine:
                 "dry_run": bool(self.cfg["dry_run"]),
                 "diag": self._diagnostics(camera_on),
                 "buttons": {
-                    "start_enabled": state == State.IDLE and not self._syncing,
+                    "start_enabled": (
+                        state == State.IDLE and not self._syncing and self.focus is None
+                    ),
                     "pause_enabled": state in (State.RUNNING, State.INTERRUPTED),
                     "pause_label": "resume" if state == State.INTERRUPTED else "pause",
                     "stop_enabled": state not in TERMINAL_UI_STATES,
@@ -560,6 +678,7 @@ BOOTING_SNAPSHOT = {
     "camera_on": False,
     "state": "STARTING",
     "session_active": False,
+    "focus_active": False,
     "in_violation": False,
     "violations": 0,
     "status_message": "Loading detection models…",
@@ -602,6 +721,8 @@ class Api:
         self._mini_window = None
         self._mini_visible = False
         self._mini_lock = threading.Lock()
+        self._focus_windows: list = []
+        self._focus_lock = threading.Lock()
 
     # -- wiring (called from main(), never from JS) --
     def _attach_windows(self, main_window, mini_window) -> None:
@@ -649,6 +770,163 @@ class Api:
                 "full traceback is in logs/app.log."
             )
         return snapshot
+
+    # -- focus mode --
+    def focus_start(self, label: str, minutes, look_down: bool = False,
+                    look_away: bool = True) -> dict:
+        if self._engine is None:
+            return {"error": "Still starting up — try again in a moment."}
+        with self._focus_lock:
+            if self._focus_windows:
+                return {"error": "A focus block is already running."}
+            result = self._engine.focus_start(label, minutes, look_down, look_away)
+            if result.get("error"):
+                return result
+            try:
+                self._open_focus_windows()
+            except Exception:
+                log.exception("failed to open focus windows")
+                self._engine.focus_cancel()
+                self._close_focus_windows()
+                return {"error": "Could not black out the screens — see logs/app.log."}
+        return {"ok": True}
+
+    def focus_cancel(self) -> dict:
+        return {"ok": True} if self._engine is None else self._engine.focus_cancel()
+
+    def focus_state(self) -> dict:
+        if self._engine is None:
+            return dict(focus_mod.IDLE_SNAPSHOT)
+        return self._engine.focus_snapshot()
+
+    def focus_exit(self) -> dict:
+        """Tear down the black windows. Called from JS once the engine reports
+        the block is over, so it lands on a pywebview thread rather than the
+        tick thread."""
+        with self._focus_lock:
+            self._close_focus_windows()
+        return {"ok": True}
+
+    def _open_focus_windows(self) -> dict:
+        """One borderless black window per monitor, the first also showing the
+        dot. Called with _focus_lock held, from a pywebview JS thread --
+        create_window() only builds the window immediately when it is called
+        off the main thread after webview.start(), which is exactly here.
+        """
+        screens = list(AppKit.NSScreen.screens())
+        if not screens:
+            raise RuntimeError("NSScreen.screens() returned nothing")
+
+        for index, screen in enumerate(screens):
+            frame = screen.frame()
+            # The dot goes on the primary display: screens()[0] is the one
+            # carrying the menu bar, which is where the user is looking when
+            # the screens go black.
+            page = "focus.html" if index == 0 else "focus-blank.html"
+            window = webview.create_window(
+                "Argus Focus",
+                str(WEB_DIR / page),
+                js_api=self,
+                width=int(frame.size.width),
+                height=int(frame.size.height),
+                frameless=True,
+                # Dragging a blackout window off its monitor would expose the
+                # desktop underneath, which defeats the whole mode.
+                easy_drag=False,
+                resizable=False,
+                on_top=True,
+                shadow=False,
+                background_color="#000000",
+            )
+            self._focus_windows.append(window)
+            self._place_focus_window(window, frame, key=index == 0)
+
+        self._set_kiosk_chrome(hidden=True)
+        return {"ok": True}
+
+    def _place_focus_window(self, window, frame, key: bool) -> None:
+        """Size and level the window with raw AppKit.
+
+        pywebview's own fullscreen is macOS native fullscreen, which animates
+        into a new Space per window -- with several monitors that is a pile of
+        Space switches, and a native-fullscreen window still shows the menu
+        bar on hover. A borderless window pinned to the screen's frame above
+        NSStatusWindowLevel (25) sits over both the menu bar (24) and the
+        dock (20) with no animation and no Space of its own.
+        """
+        def _apply():
+            try:
+                from webview.platforms.cocoa import BrowserView
+                instance = BrowserView.instances.get(window.uid)
+                if instance is None:
+                    log.warning("focus window %s never materialised", window.uid)
+                    return
+                native = instance.window
+                # Un-stale the screen pywebview cached at create time, for the
+                # same reason _reposition_mini does it.
+                instance.screen = frame
+                native.setFrame_display_(frame, True)
+                native.setLevel_(AppKit.NSStatusWindowLevel)
+                # canJoinAllSpaces | stationary | fullScreenAuxiliary: the
+                # blackout must survive a Space switch and must not be pulled
+                # into another app's fullscreen Space.
+                native.setCollectionBehavior_((1 << 0) | (1 << 4) | (1 << 8))
+                if key:
+                    # Something must be key or the page never receives the Esc
+                    # keydown, and then there is no way out but force-quit.
+                    native.makeKeyAndOrderFront_(None)
+            except Exception:
+                log.exception("failed to place focus window")
+
+        # Queued behind the create() that create_window() itself posted, so
+        # the BrowserView exists by the time this runs.
+        AppHelper.callAfter(_apply)
+
+    def _set_kiosk_chrome(self, hidden: bool) -> None:
+        """Hide/restore the menu bar, the dock and the mouse cursor.
+
+        The window level alone already covers both bars, but without
+        HideMenuBar the menu bar still slides in over the black when the
+        pointer touches the top edge -- and it shows the clock.
+        """
+        def _apply():
+            try:
+                app = AppKit.NSApplication.sharedApplication()
+                if hidden:
+                    app.setPresentationOptions_(
+                        AppKit.NSApplicationPresentationHideDock
+                        | AppKit.NSApplicationPresentationHideMenuBar
+                    )
+                    AppKit.NSCursor.hide()
+                else:
+                    app.setPresentationOptions_(AppKit.NSApplicationPresentationDefault)
+                    AppKit.NSCursor.unhide()
+            except Exception:
+                # Never fatal: a visible dock is worse focus mode, but a raised
+                # exception here would leave the black windows up with no way
+                # to take them down.
+                log.exception("failed to %s kiosk chrome", "hide" if hidden else "restore")
+
+        AppHelper.callAfter(_apply)
+
+    def _close_focus_windows(self) -> None:
+        """Called with _focus_lock held. Safe to call when nothing is open."""
+        windows, self._focus_windows = self._focus_windows, []
+        if not windows:
+            return
+        for window in windows:
+            try:
+                window.destroy()
+            except Exception:
+                log.exception("failed to destroy a focus window")
+        self._set_kiosk_chrome(hidden=False)
+        if self._main_window is not None:
+            try:
+                # Every window that could have been key was just destroyed;
+                # without this the app is frontmost with nothing focused.
+                self._main_window.show()
+            except Exception:
+                log.exception("failed to restore the main window after focus")
 
     # -- mini window --
     def enter_mini(self) -> dict:

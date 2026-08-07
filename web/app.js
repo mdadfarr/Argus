@@ -23,6 +23,7 @@
   const thumbPlaceholder = el('thumbPlaceholder');
   const cameraStatus = el('cameraStatus');
   const backToMiniBtn = el('backToMiniBtn');
+  const focusBtns = Array.from(document.querySelectorAll('.focus-btn'));
   const startBtn = el('startBtn');
   const pauseBtn = el('pauseBtn');
   const stopBtn = el('stopBtn');
@@ -93,15 +94,44 @@
       : 'calibrating… hold still and look at the screen';
   }
 
+  function requireLabel() {
+    if (labelInput.value.trim()) return true;
+    statusMessage.textContent = 'Label is required.';
+    statusMessage.classList.add('error');
+    labelInput.classList.add('error');
+    labelInput.focus();
+    return false;
+  }
+
+  for (const btn of focusBtns) {
+    btn.addEventListener('click', async () => {
+      if (!apiReady || btn.disabled) return;
+      // The label is asked for up front because there is no asking for it
+      // later: the pomodoro that follows the block starts by itself, with the
+      // screens still black.
+      if (!requireLabel()) return;
+      for (const b of focusBtns) b.disabled = true;
+      try {
+        const res = await window.pywebview.api.focus_start(
+          labelInput.value, parseInt(btn.dataset.minutes, 10), lookDownOn, lookAwayOn
+        );
+        if (res && res.error) {
+          statusMessage.textContent = res.error;
+          statusMessage.classList.add('error');
+          for (const b of focusBtns) b.disabled = false;
+          return;
+        }
+        statusMessage.classList.remove('error');
+        labelInput.classList.remove('error');
+      } catch (e) {
+        for (const b of focusBtns) b.disabled = false;
+      }
+    });
+  }
+
   startBtn.addEventListener('click', async () => {
     if (!apiReady) return;
-    if (!labelInput.value.trim()) {
-      statusMessage.textContent = 'Label is required.';
-      statusMessage.classList.add('error');
-      labelInput.classList.add('error');
-      labelInput.focus();
-      return;
-    }
+    if (!requireLabel()) return;
     const minutes = parseFloat(minutesInput.value);
     startBtn.disabled = true;
     try {
@@ -182,6 +212,9 @@
 
     const b = s.buttons || {};
     startBtn.disabled = !b.start_enabled;
+    // start_enabled already goes false while a focus block runs, so this also
+    // covers the window where the black screens are up.
+    for (const fb of focusBtns) fb.disabled = !b.start_enabled;
     pauseBtn.disabled = !b.pause_enabled;
     pauseBtn.textContent = b.pause_label || 'pause';
     stopBtn.disabled = !b.stop_enabled;
