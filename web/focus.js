@@ -16,6 +16,7 @@
 
   function cancelHold() {
     if (holdTimer !== null) { clearTimeout(holdTimer); holdTimer = null; }
+    body.classList.remove('esc-holding');
   }
 
   document.addEventListener('keydown', (e) => {
@@ -25,8 +26,10 @@
     // timer -- otherwise every repeat would restart it and the hold could
     // never complete.
     if (holdTimer !== null) return;
+    body.classList.add('esc-holding');
     holdTimer = setTimeout(() => {
       holdTimer = null;
+      body.classList.remove('esc-holding');
       if (apiReady) window.pywebview.api.focus_cancel();
     }, HOLD_MS);
   });
@@ -47,11 +50,23 @@
   // thread, well after this bridge call has returned.
   let exiting = false;
 
+  // Each alarm sound has its own beep period, so the flash has to be selected
+  // per violation kind rather than run at one fixed rate -- see focus.css.
+  const KINDS = ['left', 'phone', 'look_down', 'look_away'];
+
+  function renderViolation(s) {
+    const kind = s && s.in_violation ? s.violation_kind : null;
+    body.classList.toggle('violation', !!(s && s.in_violation));
+    for (const k of KINDS) {
+      body.classList.toggle('violation-' + k, kind === k);
+    }
+  }
+
   async function poll() {
     if (apiReady) {
       try {
         const s = await window.pywebview.api.focus_state();
-        body.classList.toggle('violation', !!(s && s.in_violation));
+        renderViolation(s);
         if (s && !s.active && !exiting) {
           exiting = true;
           window.pywebview.api.focus_exit();

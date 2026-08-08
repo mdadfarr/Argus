@@ -29,6 +29,11 @@ def build_task(session, tz_name: str) -> tuple[str, dict]:
 
 MAX_ATTEMPTS = 5
 TIMEOUT_S = 10
+# 408 Request Timeout and 429 Too Many Requests are the two 4xx that retrying
+# genuinely fixes. Every other 4xx is a client-side mistake -- a wrong URL, a
+# revoked key, a method the endpoint doesn't accept -- and no number of retries
+# will change the answer.
+RETRYABLE_STATUSES = (408, 429)
 
 
 class CalendarClientError(Exception):
@@ -67,31 +72,47 @@ def log_pomodoro(append_url: str, api_key: str, date: str, task: dict) -> None:
     headers = {"x-api-key": api_key, "content-type": "application/json"}
     body = {"date": date, "task": task}
 
+    def _backoff(attempt: int, why: str) -> None:
+        # No sleep on the last attempt: the loop is about to end and raise, so
+        # the final wait accomplishes nothing but delay.
+        if attempt >= MAX_ATTEMPTS - 1:
+            return
+        wait = min(60, 1.5 ** attempt) + random.uniform(0, 0.5)
+        log.warning(
+            "calendar append attempt %d/%d %s (retry in %.1fs)",
+            attempt + 1, MAX_ATTEMPTS, why, wait,
+        )
+        time.sleep(wait)
+
     for attempt in range(MAX_ATTEMPTS):
         try:
             r = requests.post(append_url, json=body, headers=headers, timeout=TIMEOUT_S)
         except requests.RequestException as e:
-            wait = min(60, 1.5 ** attempt) + random.uniform(0, 0.5)
-            log.warning(
-                "calendar append attempt %d/%d failed: %s (retry in %.1fs)",
-                attempt + 1, MAX_ATTEMPTS, e, wait,
-            )
-            time.sleep(wait)
+            _backoff(attempt, f"failed: {e}")
             continue
 
-        if r.status_code in (400, 401):
+        if r.status_code >= 500 or r.status_code in RETRYABLE_STATUSES:
+            _backoff(attempt, f"got HTTP {r.status_code}")
+            continue
+
+        if r.status_code >= 400:
+            # Previously only 400/401 were caught here and everything else --
+            # 403, 404, 405 -- fell through to r.json(), which raises a
+            # JSONDecodeError on the HTML body those return. That is not a
+            # CalendarClientError, so the caller filed it as transient and the
+            # entry failed identically on every future drain, forever, blocking
+            # every entry behind it.
             raise CalendarClientError(f"calendar rejected request: {r.status_code} {r.text[:200]}")
 
-        if r.status_code >= 500:
-            wait = min(60, 1.5 ** attempt) + random.uniform(0, 0.5)
-            log.warning(
-                "calendar append attempt %d/%d got HTTP %d (retry in %.1fs)",
-                attempt + 1, MAX_ATTEMPTS, r.status_code, wait,
-            )
-            time.sleep(wait)
-            continue
-
-        result = r.json().get("result")
+        try:
+            payload = r.json()
+        except ValueError as e:
+            # A 2xx with a body we can't parse is a wrong endpoint, not a
+            # network blip. Retrying it forever would block the whole queue.
+            raise CalendarClientError(
+                f"calendar returned HTTP {r.status_code} with an unreadable body: {e}"
+            ) from e
+        result = payload.get("result") if isinstance(payload, dict) else None
         if result == "duplicate":
             log.info("session %s already logged — idempotent no-op", task["id"])
         return

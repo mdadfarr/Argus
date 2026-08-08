@@ -16,11 +16,57 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  /* Slow enough to read as a mood change rather than a strobe. */
-  transition: background-color 120ms linear;
 }
 
-body.violation { background: #B0161B; }
+/* Red/black alternation timed to the alarm sound itself, not an arbitrary
+   rate. Red tracks the tone, black tracks the gap between beeps.
+
+   The three sounds have three different beep periods, so one fixed rate cannot
+   match them -- the previous single 500ms animation was tuned against a
+   mismeasured looked_down.aiff and ran at twice its real rate, which is the
+   sound used for both look_down and look_away and therefore almost every
+   violation. Measured from the PCM (10ms RMS envelope, autocorrelation over
+   the first 10s):
+
+     looked_down.aiff    1000ms period, ~680ms tone / ~320ms gap  (68%)
+     left_room.aiff       500ms period, ~290ms tone / ~210ms gap  (58%)
+     phone_detected.aiff  330ms period
+
+   focus.js sets a violation-<kind> class alongside .violation so each kind can
+   have its own. The bare .violation rule is the fallback for a kind arriving
+   without a class of its own; it uses looked_down's timing because that is the
+   sound main.VIOLATION_SOUNDS falls back to. */
+body.violation {
+  animation: argus-flash-slow 1000ms steps(1, end) infinite;
+}
+
+body.violation.violation-look_down,
+body.violation.violation-look_away {
+  animation: argus-flash-slow 1000ms steps(1, end) infinite;
+}
+
+body.violation.violation-left {
+  animation: argus-flash-mid 500ms steps(1, end) infinite;
+}
+
+body.violation.violation-phone {
+  animation: argus-flash-fast 330ms steps(1, end) infinite;
+}
+
+@keyframes argus-flash-slow {
+  0%, 68% { background-color: #B0161B; }
+  68.1%, 100% { background-color: #000; }
+}
+
+@keyframes argus-flash-mid {
+  0%, 58% { background-color: #B0161B; }
+  58.1%, 100% { background-color: #000; }
+}
+
+@keyframes argus-flash-fast {
+  0%, 55% { background-color: #B0161B; }
+  55.1%, 100% { background-color: #000; }
+}
 
 /* Only focus.html carries has-dot; focus-blank.html is the other monitors. */
 #dot { display: none; }
@@ -32,3 +78,17 @@ body.has-dot #dot {
   border-radius: 50%;
   background: #FFF;
 }
+
+#esc-hint {
+  display: none;
+  position: fixed;
+  bottom: 64px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: rgba(255, 255, 255, 0.55);
+  font: 13px -apple-system, BlinkMacSystemFont, sans-serif;
+  letter-spacing: 0.02em;
+  pointer-events: none;
+}
+
+body.esc-holding #esc-hint { display: block; }

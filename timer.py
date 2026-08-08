@@ -174,8 +174,16 @@ class SessionTimer:
             self._checkpoint()
             return
 
-        if self._on_camera_open:
-            self._on_camera_open()
+        if self._on_camera_open and not self._on_camera_open():
+            # Ignoring this result sent the session into CALIBRATING against a
+            # camera that never opened: no reading ever arrived, so calibration
+            # timed out and reported "no face detected" -- a misleading
+            # diagnosis of a camera problem that also bypassed the retry
+            # backoff entirely. Go where _tick_calibrating goes on a bad frame.
+            self.state = State.CAMERA_ERROR
+            self.camera_next_retry = now_mono + self.cfg["camera_reopen_backoff_seconds"][0]
+            self._checkpoint()
+            return
         self.state = State.CALIBRATING
         self.calibration_deadline = now_mono + self.cfg["calibration_seconds"]
         if self._on_calibrate_start:
@@ -199,8 +207,9 @@ class SessionTimer:
         it's just not finishing, so nothing punitive is recorded."""
         if self.state in TERMINAL_STATES or self.session is None:
             return
-        if self._on_alarm_stop:
-            self._on_alarm_stop()
+        # _abort() stops the alarm itself now -- it used not to, and this
+        # method's own call was the workaround that hid it from the Stop
+        # button while leaving every other abort path sounding.
         self._abort("user_stopped")
 
     def manual_resume(self):
@@ -264,8 +273,19 @@ class SessionTimer:
             # Close the calibration window and commit the baselines. Without
             # this the vision worker stays in calibrating mode forever and
             # never reports a pitch/yaw delta at all.
-            if self._on_calibrate_finish:
-                self._on_calibrate_finish()
+            #
+            # An explicit False means the baseline was rejected as implausible
+            # (off-axis, or sampled while the head was still moving). Running
+            # anyway means every reading is measured against a pose the user
+            # never holds, which reads as a permanent violation.
+            if self._on_calibrate_finish and self._on_calibrate_finish() is False:
+                if self._on_notify:
+                    self._on_notify(
+                        "Calibration failed: sit square to the screen and hold "
+                        "still for the first few seconds. Session cancelled."
+                    )
+                self._to_idle_after_cancel()
+                return
             self._look_down_state = False
             self._look_away_state = False
             self.state = State.RUNNING
@@ -454,6 +474,11 @@ class SessionTimer:
         self.last_outcome = record
 
     def _abort(self, reason: str, detail: str = ""):
+        # _fail() has always done this; _abort() did not, so a clock gap or a
+        # dead camera during VIOLATION_GRACE ended the session and left the
+        # alarm sounding until the file played out -- up to ~26s.
+        if self._on_alarm_stop:
+            self._on_alarm_stop()
         record = self.build_record("aborted", reason, detail=detail)
         ledger.record_session(record)
         self.state = State.ABORTED

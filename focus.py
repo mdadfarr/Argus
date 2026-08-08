@@ -52,6 +52,23 @@ class FocusState(Enum):
 
 TERMINAL = (FocusState.DONE, FocusState.CANCELLED)
 
+# Seconds of clean (no violation condition active) time required before a
+# held violation clears. Without a debounce here, the leaky-bucket sustain
+# in SustainedCondition can flicker a borderline reading across the trigger
+# threshold tick to tick, clearing violation_kind for one tick and setting it
+# right back the next -- Engine._tick_focus only stops the alarm on the
+# False edge, so a flicker like that leaves it playing continuously.
+RESOLVE_SECONDS = 2.0
+
+# Seconds of missing/unusable frames after which the block gives up on the
+# camera for the moment: it force-clears any held violation (so Engine sees the
+# falling edge and stops the alarm) and reports camera_lost so Engine can retry
+# the open. Without this a single glitch -- VisionWorker releases the capture on
+# any read failure -- left detection dead for the rest of the block, and a
+# violation latched at that instant could never clear, because the clean-time
+# accumulator only advances on a usable frame.
+CAMERA_LOST_SECONDS = 3.0
+
 
 class FocusSession:
     """Pure state machine -- no threads, no I/O, no window handles.
@@ -88,6 +105,11 @@ class FocusSession:
         self.look_away_cond = SustainedCondition(
             focus_cfg(cfg, "focus_look_away_threshold_seconds")
         )
+        self._clean_acc = 0.0
+        self._bad_acc = 0.0
+        # True while the camera has been giving nothing usable for longer than
+        # CAMERA_LOST_SECONDS. Engine watches this to drive reopen attempts.
+        self.camera_lost = False
 
     # ---------- latches (same hysteresis shape as SessionTimer) ----------
     def _update_look_down_latch(self, reading) -> None:
@@ -149,8 +171,23 @@ class FocusSession:
         violation is not a way to shorten the block."""
         if reading is None or not reading.ok:
             # No usable frame (camera reopening, dropped frame). Neither
-            # punish nor clear a held violation on missing data.
+            # punish nor clear a held violation on missing data -- but only for
+            # so long. Past CAMERA_LOST_SECONDS the camera is gone rather than
+            # blinking, and holding a violation the user has no way to resolve
+            # means the screens flash red and the alarm restarts until the
+            # block ends.
+            self._bad_acc += dt
+            if self._bad_acc >= CAMERA_LOST_SECONDS:
+                self.camera_lost = True
+                if self.violation_kind is not None:
+                    log.info("focus: camera lost -- clearing held %s violation",
+                             self.violation_kind)
+                    self.violation_kind = None
+                    self._clean_acc = 0.0
             return
+
+        self._bad_acc = 0.0
+        self.camera_lost = False
 
         self._update_look_down_latch(reading)
         self._update_look_away_latch(reading)
@@ -170,15 +207,29 @@ class FocusSession:
         elif away_sustained:
             kind = "look_away"
 
-        if kind is None:
-            self.violation_kind = None
+        if kind is not None:
+            self._clean_acc = 0.0
+            # On a *change* of kind too, not just None -> kind: a look_down
+            # escalating to left (the user walked out) otherwise kept playing
+            # the look-down sound, and left is the one violation whose whole
+            # point is being audible from another room.
+            if kind != self.violation_kind:
+                self.violations += 1
+                self.violation_started = kind
+                log.info("focus violation %d: %s", self.violations, kind)
+            self.violation_kind = kind
             return
 
         if self.violation_kind is None:
-            self.violations += 1
-            self.violation_started = kind
-            log.info("focus violation %d: %s", self.violations, kind)
-        self.violation_kind = kind
+            return
+
+        # Held violation, but the sustain condition just dropped -- require
+        # RESOLVE_SECONDS of clean time in a row before actually clearing it,
+        # rather than the instant the leaky bucket dips below threshold.
+        self._clean_acc += dt
+        if self._clean_acc >= RESOLVE_SECONDS:
+            self.violation_kind = None
+            self._clean_acc = 0.0
 
     # ---------- control ----------
     def cancel(self) -> None:

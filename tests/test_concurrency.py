@@ -45,6 +45,9 @@ def _bare_engine(cfg):
     # and a missing attribute here surfaces only as the poller thread dying.
     e.focus = None
     e._focus_handoff = None
+    e._next_drain_mono = time.monotonic() + main.DRAIN_INTERVAL_S
+    e._draining = False
+    e._focus_reopen_next = 0.0
     return e
 
 

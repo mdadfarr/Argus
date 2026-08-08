@@ -46,6 +46,37 @@ class CameraUnavailable(Exception):
     pass
 
 
+# ---------- calibration plausibility ----------
+# A baseline is the pose the user is expected to hold for a whole block, so it
+# has to be roughly head-on. Baselines of ~48 deg yaw were recorded in practice
+# (calibration starts the instant the button is clicked, while the pointer is
+# still moving away and the other monitors are going black). Against a 40 deg
+# look-away threshold that makes the user's normal posture a *permanent*
+# violation: the "clean" condition the resolve debounce waits for is
+# unreachable, so the alarm never stops and the only exit is force-quit.
+MAX_BASELINE_DEGREES = 25.0
+# The samples all come from one supposedly-still head. A wide spread means the
+# user was still moving, so the median is not a pose they will hold.
+MAX_BASELINE_SPREAD_DEGREES = 20.0
+MIN_CALIBRATION_SAMPLES = 10
+
+
+def _baseline_from(samples: list[float]) -> tuple[float | None, str]:
+    """Median of the calibration samples, or (None, reason) if the result can't
+    be trusted as a resting pose."""
+    if len(samples) < MIN_CALIBRATION_SAMPLES:
+        return None, f"only {len(samples)} usable samples"
+    ordered = sorted(samples)
+    median = ordered[len(ordered) // 2]
+    lo = ordered[int(len(ordered) * 0.05)]
+    hi = ordered[int(len(ordered) * 0.95)]
+    if hi - lo > MAX_BASELINE_SPREAD_DEGREES:
+        return None, f"samples spread over {hi - lo:.1f} deg (still moving?)"
+    if abs(median) > MAX_BASELINE_DEGREES:
+        return None, f"baseline {median:.1f} deg is not head-on"
+    return median, ""
+
+
 @dataclass(frozen=True)
 class FrameReading:
     ok: bool
@@ -222,9 +253,17 @@ class VisionWorker(threading.Thread):
 
         self.cap: cv2.VideoCapture | None = None
         self._cap_lock = threading.Lock()
+        # Open handshake. _open_seq is bumped by each requester; the worker
+        # publishes _open_done_seq for the request it actually serviced, so a
+        # caller only ever accepts a result produced for its own request. A
+        # bare Event let a completion that was already in flight satisfy the
+        # *next* caller's wait, which then read a still-None _open_result and
+        # reported "camera unavailable" for a camera that opened fine.
+        self._open_cv = threading.Condition()
         self._open_requested = threading.Event()
         self._open_result: bool | None = None
-        self._open_done = threading.Event()
+        self._open_seq = 0
+        self._open_done_seq = 0
         self._stop = threading.Event()
 
         # Calibration state is written by the tick thread (via SessionTimer's
@@ -292,19 +331,34 @@ class VisionWorker(threading.Thread):
         with self._cap_lock:
             if self.cap is not None:
                 return True
-        # Clearing _open_result matters: on timeout the old code returned
-        # whatever the *previous* open produced, so a stale True sent the timer
-        # into CALIBRATING against a camera that was never opened.
-        self._open_result = None
-        self._open_done.clear()
-        self._open_requested.set()
-        if not self._open_done.wait(timeout):
-            log.warning("camera open did not complete within %.1fs", timeout)
-            return False
-        return bool(self._open_result)
+        # Waiting on a sequence number rather than an Event matters: on timeout
+        # the old code returned whatever the *previous* open produced, so a
+        # stale True sent the timer into CALIBRATING against a camera that was
+        # never opened -- and a stale set() made a good camera report as
+        # unavailable.
+        with self._open_cv:
+            self._open_seq += 1
+            my_seq = self._open_seq
+            self._open_requested.set()
+            deadline = time.monotonic() + timeout
+            while self._open_done_seq < my_seq:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log.warning("camera open did not complete within %.1fs", timeout)
+                    return False
+                self._open_cv.wait(remaining)
+            return bool(self._open_result)
 
     def request_close(self) -> None:
-        self._open_requested.clear()
+        with self._open_cv:
+            if self._open_requested.is_set():
+                # Cancel a request the worker has not picked up yet, and release
+                # its caller now instead of leaving it to time out after the
+                # full 5s against an open that will never happen.
+                self._open_requested.clear()
+                self._open_result = False
+                self._open_done_seq = self._open_seq
+                self._open_cv.notify_all()
         with self._cap_lock:
             if self.cap is not None:
                 self.cap.release()
@@ -325,10 +379,17 @@ class VisionWorker(threading.Thread):
             # counting toward the new session's phone_sustain_seconds budget.
             self._last_phone_confidence = 0.0
 
-    def finish_calibration(self) -> None:
+    def finish_calibration(self) -> bool:
         """Discards the first second of samples (settling time) and takes the
         median of the rest as the baseline -- what makes a fixed relative
         threshold work across different desks and lid angles (fixes I-08).
+
+        Returns True if a usable baseline was committed. A baseline that is not
+        plausibly head-on, or that came from a head that was still moving, is
+        rejected outright (both baselines left None) rather than committed: an
+        off-axis baseline makes the user's normal posture a permanent violation
+        that no debounce can ever clear. Callers must treat False as a failed
+        calibration and end the block/session rather than running blind.
 
         MUST be called when the calibration window closes. It previously was
         not called anywhere at all, so _calibrating stayed True forever,
@@ -339,64 +400,124 @@ class VisionWorker(threading.Thread):
             self._calibrating = False
             samples = list(self._calib_samples)
             start = self._calib_start
-            usable_p = sorted(p for (ts, p, y) in samples if ts - start >= 1.0)
-            usable_y = sorted(y for (ts, p, y) in samples if ts - start >= 1.0)
-            self._baseline_pitch = usable_p[len(usable_p) // 2] if usable_p else None
-            self._baseline_yaw = usable_y[len(usable_y) // 2] if usable_y else None
-        log.info("calibration finished: baseline pitch=%s yaw=%s (%d samples)",
-                 None if self._baseline_pitch is None else round(self._baseline_pitch, 1),
-                 None if self._baseline_yaw is None else round(self._baseline_yaw, 1),
-                 len(usable_p))
+            usable_p = [p for (ts, p, y) in samples if ts - start >= 1.0]
+            usable_y = [y for (ts, p, y) in samples if ts - start >= 1.0]
+            pitch, pitch_reason = _baseline_from(usable_p)
+            yaw, yaw_reason = _baseline_from(usable_y)
+            if pitch is None or yaw is None:
+                # Partial baselines are worse than none: half the detectors
+                # would run against a pose the user is not actually holding.
+                self._baseline_pitch = None
+                self._baseline_yaw = None
+                ok = False
+            else:
+                self._baseline_pitch = pitch
+                self._baseline_yaw = yaw
+                ok = True
+            n = len(usable_p)
+        if ok:
+            log.info("calibration finished: baseline pitch=%s yaw=%s (%d samples)",
+                     round(pitch, 1), round(yaw, 1), n)
+        else:
+            log.warning(
+                "calibration rejected (%d samples): pitch %s / yaw %s",
+                n, pitch_reason or "ok", yaw_reason or "ok",
+            )
+        return ok
 
     @property
     def calibrated(self) -> bool:
         with self._calib_lock:
-            return self._baseline_pitch is not None
+            return self._baseline_pitch is not None and self._baseline_yaw is not None
 
     # ---------- main loop ----------
     def run(self) -> None:
         while not self._stop.is_set():
-            if self._open_requested.is_set():
-                with self._cap_lock:
-                    if self.cap is None:
-                        try:
-                            self.cap = open_camera(self.cfg)
-                            self._open_result = True
-                            self.resolved_camera_name = resolved_camera_name()
-                        except CameraUnavailable as e:
-                            log.warning("camera open failed: %s", e)
-                            self.cap = None
-                            self._open_result = False
-                self._open_done.set()
+            try:
+                self._run_once()
+            except Exception:
+                # Without this the thread dies for the whole life of the
+                # process and nothing restarts it: request_open() then blocks
+                # its full timeout and returns False forever, so the app spends
+                # the rest of the run reporting "camera open did not complete
+                # within 5.0s" with no hint of the real cause. Engine._loop has
+                # the same guard for the same reason.
+                log.exception("error in vision worker loop")
+                time.sleep(0.5)
 
-            # The read MUST happen while holding _cap_lock. Grabbing the handle
-            # under the lock and then reading outside it leaves a window where
-            # request_close() can release the AVFoundation capture session
-            # while a frame grab is still in flight on it -- OpenCV's
-            # CaptureDelegate then messages freed memory and the whole process
-            # segfaults (objc_msgSend on a dangling pointer). That is exactly
-            # what killed the first session that ever ran to completion.
+    def _take_open_request(self) -> int | None:
+        """Claim a pending open request, if any, and return its sequence
+        number. Claiming and clearing under _open_cv is what stops a request
+        made concurrently with the claim from being dropped."""
+        with self._open_cv:
+            if not self._open_requested.is_set():
+                return None
+            self._open_requested.clear()
+            return self._open_seq
+
+    def _publish_open_result(self, seq: int, result: bool) -> None:
+        with self._open_cv:
+            self._open_result = result
+            if seq > self._open_done_seq:
+                self._open_done_seq = seq
+            self._open_cv.notify_all()
+
+    def _perform_open(self, seq: int) -> None:
+        result = False
+        try:
             with self._cap_lock:
-                cap = self.cap
-                if cap is None:
-                    reading = None
+                if self.cap is not None:
+                    result = True
                 else:
-                    reading = self._read_once(cap)
-                    # Release on any read failure so the next
-                    # request_open() call (driven by timer.py's backoff
-                    # schedule) actually attempts a fresh open instead of
-                    # trivially reporting success against a stale, broken
-                    # capture handle.
-                    if not reading.ok and self.cap is not None:
-                        self.cap.release()
+                    try:
+                        self.cap = open_camera(self.cfg)
+                        self.resolved_camera_name = resolved_camera_name()
+                        result = True
+                    except Exception as e:
+                        # Not just CameraUnavailable: resolve_camera_index does
+                        # unguarded filesystem I/O, and an escaping error there
+                        # used to kill this thread outright.
+                        log.warning("camera open failed: %s", e)
                         self.cap = None
+                        result = False
+        finally:
+            # In a finally so a waiter is never left hanging for the full
+            # timeout, whatever went wrong above.
+            self._publish_open_result(seq, result)
 
-            if reading is None:
-                time.sleep(0.05)
-                continue
-            if not reading.ok:
-                time.sleep(0.1)
-            self._push(reading)
+    def _run_once(self) -> None:
+        pending = self._take_open_request()
+        if pending is not None:
+            self._perform_open(pending)
+
+        # The read MUST happen while holding _cap_lock. Grabbing the handle
+        # under the lock and then reading outside it leaves a window where
+        # request_close() can release the AVFoundation capture session
+        # while a frame grab is still in flight on it -- OpenCV's
+        # CaptureDelegate then messages freed memory and the whole process
+        # segfaults (objc_msgSend on a dangling pointer). That is exactly
+        # what killed the first session that ever ran to completion.
+        with self._cap_lock:
+            cap = self.cap
+            if cap is None:
+                reading = None
+            else:
+                reading = self._read_once(cap)
+                # Release on any read failure so the next
+                # request_open() call (driven by timer.py's backoff
+                # schedule) actually attempts a fresh open instead of
+                # trivially reporting success against a stale, broken
+                # capture handle.
+                if not reading.ok and self.cap is not None:
+                    self.cap.release()
+                    self.cap = None
+
+        if reading is None:
+            time.sleep(0.05)
+            return
+        if not reading.ok:
+            time.sleep(0.1)
+        self._push(reading)
 
     def _push(self, reading: FrameReading) -> None:
         try:

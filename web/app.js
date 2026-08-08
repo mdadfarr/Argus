@@ -38,6 +38,7 @@
   let lookAwayOn = true;
   let defaultsApplied = false;
   let miniShown = false;
+  let focusWasActive = false;
 
   function setToggle(btn, on) { btn.dataset.on = String(on); }
 
@@ -223,6 +224,19 @@
     if (!defaultsApplied && s.default_minutes) {
       minutesInput.value = s.default_minutes;
       defaultsApplied = true;
+    }
+
+    // Fallback teardown for the black focus windows. focus.js's own poll is
+    // the primary path and normally gets there first; this exists because that
+    // was the *only* path, and if its bridge breaks the user is left with every
+    // screen black, no cursor and no menu bar, with nothing in the UI able to
+    // recover. Calling focus_exit() twice is safe -- it no-ops when no windows
+    // are open.
+    if (s.focus_active) {
+      focusWasActive = true;
+    } else if (focusWasActive) {
+      focusWasActive = false;
+      if (apiReady) window.pywebview.api.focus_exit();
     }
 
     // Session ended by any path (success, failure, abort) -> restore layout.

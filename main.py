@@ -85,11 +85,30 @@ HEADLINES = {
 # layout (main window visible, mini hidden, start enabled).
 TERMINAL_UI_STATES = (State.IDLE, State.LOGGING, State.FAILED, State.ABORTED)
 
+# How often the tick loop retries anything left in the outbox. Long enough that
+# a sustained outage isn't hammered, short enough that coming back online during
+# a work day actually syncs the sessions queued while it was down.
+DRAIN_INTERVAL_S = 300.0
+# Wait between reopen attempts after the camera drops mid focus block.
+FOCUS_REOPEN_INTERVAL_S = 2.0
+# How long the black windows may stay up after the engine says the block is
+# over before the watchdog closes them itself. Long enough that the normal
+# focus.js teardown always wins.
+FOCUS_TEARDOWN_GRACE_S = 4.0
+
 
 def _is_permanent_failure(exc: BaseException) -> bool:
     """Failures no amount of retrying will fix -- rejected auth or a malformed
-    request. Everything else (timeouts, 5xx, DNS) is worth queueing for."""
-    return isinstance(exc, (calendar_client.CalendarClientError, config_mod.ConfigError))
+    request. Everything else (timeouts, 5xx, DNS) is worth queueing for.
+
+    ConfigError deliberately does NOT belong here. It is raised when the
+    Keychain lookup fails: a locked Keychain, an entry not added yet, `security`
+    momentarily unavailable. Those are all transient, but a permanent failure is
+    dropped from the outbox -- so classifying it this way erased finished
+    sessions, and a drain reached with the key unavailable would have walked the
+    whole queue deleting every entry in it.
+    """
+    return isinstance(exc, calendar_client.CalendarClientError)
 
 
 def _install_excepthooks() -> None:
@@ -144,6 +163,10 @@ class Engine:
         # Settings captured at focus_start, replayed into the pomodoro that
         # auto-starts when the block ends.
         self._focus_handoff: dict | None = None
+        # Periodic outbox retry, driven from the tick loop but run off it.
+        self._next_drain_mono = time.monotonic() + DRAIN_INTERVAL_S
+        self._draining = False
+        self._focus_reopen_next = 0.0
 
         self.reading_queue: queue.Queue = queue.Queue(maxsize=2)
         self.preview_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -187,16 +210,29 @@ class Engine:
         """Perform the camera open for a due CAMERA_ERROR retry out here,
         before _loop takes self.lock, so the _open_camera() call inside the
         tick is instant. Reading timer state needs the lock only briefly."""
+        now = time.monotonic()
         with self.lock:
             due = (
                 self.timer.state == State.CAMERA_ERROR
                 and self.timer.camera_next_retry is not None
-                and time.monotonic() >= self.timer.camera_next_retry
+                and now >= self.timer.camera_next_retry
+            )
+            # Focus mode has no CAMERA_ERROR state of its own; the block just
+            # reports that it has had nothing usable for a while. Reopen from
+            # out here for the same reason the timer's retry does.
+            focus_due = (
+                self.focus is not None
+                and self.focus.camera_lost
+                and now >= self._focus_reopen_next
             )
         if due:
             opened = self.worker.request_open()
             with self.lock:
                 self._camera_open_hint = opened
+        if focus_due:
+            self._focus_reopen_next = time.monotonic() + FOCUS_REOPEN_INTERVAL_S
+            if not self.worker.request_open():
+                log.warning("focus block: camera reopen failed, will retry")
 
     def _close_camera(self) -> None:
         self.worker.request_close()
@@ -204,8 +240,11 @@ class Engine:
     def _start_calibration(self) -> None:
         self.worker.start_calibration()
 
-    def _finish_calibration(self) -> None:
-        self.worker.finish_calibration()
+    def _finish_calibration(self) -> bool:
+        """Returns False if the baseline was rejected -- see
+        VisionWorker.finish_calibration. SessionTimer treats that as a failed
+        calibration rather than running against a pose the user never holds."""
+        return self.worker.finish_calibration()
 
     def _notify(self, message: str) -> None:
         self.status_message = message
@@ -264,12 +303,46 @@ class Engine:
 
         threading.Thread(target=worker, name="argus-startup-sync", daemon=True).start()
 
+    def _maybe_drain_outbox(self) -> None:
+        """Retry queued sessions periodically, not just once at launch.
+
+        The startup drain runs only when the preflight succeeded, so the one
+        case the outbox exists for -- being offline -- was also the one case
+        nothing ever drained it. Sessions queued while offline sat there until
+        some future launch happened to have a working network at exactly the
+        moment of the preflight, while the UI promised "will retry".
+
+        Runs on its own thread: the drain does network I/O with a retry ladder,
+        and this is called from the tick thread.
+        """
+        if self.cfg["dry_run"] or self._stopping:
+            return
+        now = time.monotonic()
+        if now < self._next_drain_mono or self._draining:
+            return
+        self._next_drain_mono = now + DRAIN_INTERVAL_S
+
+        def worker():
+            try:
+                if not outbox.read_all():
+                    return
+                with self._send_lock:
+                    outbox.drain(self._send_to_calendar, is_permanent=_is_permanent_failure)
+            except Exception as e:
+                log.warning("periodic outbox drain error: %s", e)
+            finally:
+                self._draining = False
+
+        self._draining = True
+        threading.Thread(target=worker, name="argus-outbox-drain", daemon=True).start()
+
     # ---------- tick loop ----------
     def _loop(self) -> None:
         interval = self.cfg["check_interval_ms"] / 1000.0
         while not self._stopping:
             try:
                 self._prewarm_camera()
+                self._maybe_drain_outbox()
                 with self.lock:
                     reading = None
                     try:
@@ -369,15 +442,16 @@ class Engine:
 
         def worker():
             with self._send_lock:
+                drop = False
                 try:
                     self._send_to_calendar(date, task)
-                except (calendar_client.CalendarClientError, config_mod.ConfigError) as e:
+                except calendar_client.CalendarClientError as e:
                     # Non-retryable: bad auth or bad request shape. Retrying
                     # will never fix it, so drop it from the outbox rather than
                     # leaving a poison entry that halts every later drain.
                     log.error("calendar rejected session %s: %s", session_id, e)
-                    outbox.remove(task["id"])
                     message, warning = "Saved locally but NOT logged to the calendar.", str(e)
+                    drop = True
                 except Exception as e:
                     log.warning("calendar send failed for %s, left in outbox: %s", session_id, e)
                     message, warning = "Queued — will retry syncing to calendar.", None
@@ -385,8 +459,19 @@ class Engine:
                     # Without this the entry survived a successful send and was
                     # replayed on every subsequent launch, relying on the
                     # server's dedupe to no-op it.
-                    outbox.remove(task["id"])
                     message, warning = f"Logged: {task['text']}", ""
+                    drop = True
+
+                # Deliberately after message/warning are decided, and guarded:
+                # remove() rewrites the whole outbox, so a raise here used to
+                # escape (an except: handler and an else: block are both outside
+                # the try) and skip the status update entirely -- the UI sat on
+                # "Logging to calendar…" forever and the thread died silently.
+                if drop:
+                    try:
+                        outbox.remove(task["id"])
+                    except Exception:
+                        log.exception("failed to remove outbox entry %s", task["id"])
 
             with self.lock:
                 self.status_message = message
@@ -403,6 +488,16 @@ class Engine:
         # UI for the whole AVFoundation open right as the user hits Start.
         hint = self.worker.request_open() if camera_enabled else None
         with self.lock:
+            if self.focus is not None:
+                # focus_start() refuses while a session runs; the reverse check
+                # did not exist, and Api.start is reachable from every window
+                # including the black ones. Two state machines driving the same
+                # alarm and the same camera is not a state worth having.
+                #
+                # The camera is deliberately NOT closed on this path even though
+                # request_open() ran above: the focus block already owns it, and
+                # the open was a no-op against its handle.
+                return {"error": "A focus block is running."}
             self._camera_open_hint = hint
             try:
                 self.timer.start(raw_label, look_down_enabled, minutes=minutes,
@@ -509,13 +604,33 @@ class Engine:
             return
 
         was_calibrating = session.state == focus_mod.FocusState.CALIBRATING
+        was_in_violation = session.violation_kind is not None
         session.tick(reading, time.monotonic())
 
-        if was_calibrating and session.state == focus_mod.FocusState.RUNNING:
-            self.worker.finish_calibration()
+        # The CALIBRATING -> RUNNING transition is purely time-based, so nothing
+        # here checked that calibration actually produced a baseline. Without
+        # one, every pitch/yaw delta is None and look-down/look-away are inert
+        # for the whole block with no warning anywhere -- and a baseline that IS
+        # committed but off-axis is worse still: the user's normal posture
+        # becomes a violation that can never clear.
+        calibrating_done = was_calibrating and session.state == focus_mod.FocusState.RUNNING
+        if calibrating_done and not self.worker.finish_calibration():
+            log.warning("focus block: calibration rejected, ending the block")
+            session.cancel()
+            self._finish_focus(start_pomodoro=False)
+            self.status_message = (
+                "Focus block cancelled: calibration failed. Sit square to the "
+                "screen and hold still for the first few seconds."
+            )
+            return
 
         if session.violation_started is not None:
             self._on_alarm_start(session.violation_started)
+        elif was_in_violation and session.violation_kind is None:
+            # Focus mode has no grace period to drive this from -- a violation
+            # clearing means "looked back", which must silence the alarm right
+            # away or it keeps playing until the block or a later violation ends.
+            self.alarm.stop()
 
         if session.state == focus_mod.FocusState.DONE:
             self._finish_focus(start_pomodoro=True)
@@ -527,11 +642,19 @@ class Engine:
 
         The black windows are NOT closed here -- they are native windows owned
         by Api, and driving them from this thread is the class of bug that
-        caused the camera segfault. The main window's poll sees focus_active
-        go false and calls Api.focus_exit() from a pywebview thread instead.
+        caused the camera segfault. focus.js's own poll sees `active` go false
+        and calls Api.focus_exit() from a pywebview thread instead, with the
+        main window's poll on `focus_active` as a fallback.
         """
         handoff, self._focus_handoff = self._focus_handoff or {}, None
         self.focus = None
+
+        # Unconditionally, and before anything else. Engine._tick_focus stops
+        # the alarm only on the falling edge it computes itself, and cancel()
+        # clears violation_kind from a bridge thread before the next tick ever
+        # runs -- so the edge is already gone by then and the Esc-hold exit left
+        # the sound playing with the screens down, for up to ~26s.
+        self.alarm.stop()
 
         if not start_pomodoro:
             self.worker.request_close()
@@ -539,15 +662,32 @@ class Engine:
             return
 
         self.alarm.start()  # cfg's alarm_sound_path -- the block is over
-        # start() re-opens (a no-op, the camera is already ours) and kicks off
-        # a fresh calibration for the session proper.
-        result = self.start(handoff.get("label", ""), self.cfg["pomodoro_minutes"],
-                            handoff.get("look_down", False), True,
-                            handoff.get("look_away", False))
+        # Handed to a thread rather than called inline: Engine.start() begins
+        # with request_open(), deliberately outside self.lock because it blocks
+        # for up to 5s, and this method runs from the tick loop with the lock
+        # already held. If the camera was released during the block the open is
+        # real, and the whole UI freezes on snapshot() for the duration.
+        self.status_message = "Focus block done — starting your session…"
+        threading.Thread(target=self._start_handoff_session, args=(handoff,),
+                         name="argus-focus-handoff", daemon=True).start()
+
+    def _start_handoff_session(self, handoff: dict) -> None:
+        """The focus -> pomodoro handoff, off the tick thread."""
+        try:
+            result = self.start(handoff.get("label", ""), self.cfg["pomodoro_minutes"],
+                                handoff.get("look_down", False), True,
+                                handoff.get("look_away", False))
+        except Exception:
+            log.exception("focus handoff to pomodoro failed")
+            self.worker.request_close()
+            with self.lock:
+                self.status_message = "Focus done, but the session did not start — see logs/app.log."
+            return
         if result.get("error"):
             log.error("focus handoff to pomodoro failed: %s", result["error"])
             self.worker.request_close()
-            self.status_message = f"Focus done, but the session did not start: {result['error']}"
+            with self.lock:
+                self.status_message = f"Focus done, but the session did not start: {result['error']}"
 
     def _diagnostics(self, camera_on: bool) -> dict:
         """Live detector output, surfaced so thresholds can be tuned against
@@ -842,7 +982,44 @@ class Api:
             self._place_focus_window(window, frame, key=index == 0)
 
         self._set_kiosk_chrome(hidden=True)
+        self._start_focus_watchdog()
         return {"ok": True}
+
+    def _start_focus_watchdog(self) -> None:
+        """Last-resort teardown for the black windows.
+
+        Until now there was exactly one path: focus.js's own poll calling
+        focus_exit(), with a catch that swallows every error. If that bridge
+        breaks -- which has happened, with a stale cached focus.js -- the user
+        is left with every screen black, no cursor, no menu bar and no dock,
+        and Esc-hold does not help because focus_cancel() only flips engine
+        state. This thread is not the tick thread and does not touch AppKit
+        directly, so it is no more dangerous than the JS bridge call it stands
+        in for.
+        """
+        def watch():
+            idle_since: float | None = None
+            while True:
+                time.sleep(0.5)
+                with self._focus_lock:
+                    if not self._focus_windows:
+                        return
+                engine = self._engine
+                active = engine is not None and engine.focus_snapshot().get("active")
+                if active:
+                    idle_since = None
+                    continue
+                now = time.monotonic()
+                if idle_since is None:
+                    idle_since = now
+                elif now - idle_since >= FOCUS_TEARDOWN_GRACE_S:
+                    log.warning("focus windows still up %.0fs after the block ended — "
+                                "tearing them down from the watchdog",
+                                FOCUS_TEARDOWN_GRACE_S)
+                    self.focus_exit()
+                    return
+
+        threading.Thread(target=watch, name="argus-focus-watchdog", daemon=True).start()
 
     def _place_focus_window(self, window, frame, key: bool) -> None:
         """Size and level the window with raw AppKit.
