@@ -863,11 +863,14 @@ class Api:
         self._mini_lock = threading.Lock()
         self._focus_windows: list = []
         self._focus_lock = threading.Lock()
+        self._countdown_window = None
+        self._countdown_lock = threading.Lock()
 
     # -- wiring (called from main(), never from JS) --
-    def _attach_windows(self, main_window, mini_window) -> None:
+    def _attach_windows(self, main_window, mini_window, countdown_window) -> None:
         self._main_window = main_window
         self._mini_window = mini_window
+        self._countdown_window = countdown_window
 
     def _attach_engine(self, engine: Engine) -> None:
         self._engine = engine
@@ -914,19 +917,32 @@ class Api:
     # -- focus mode --
     def focus_start(self, label: str, minutes, look_down: bool = False,
                     look_away: bool = True) -> dict:
+        """Engine-side start only -- does NOT open the black windows.
+
+        Split out from window-opening so the countdown popup flow (see
+        open_countdown_popup) can run this during its 5s countdown -- which
+        is when the up-to-5s camera open actually happens -- and only pop
+        the black screens up once the popup itself has closed, via
+        focus_open_windows(). Calling this while the popup is still up would
+        otherwise put the blackout behind the popup mid-countdown."""
         if self._engine is None:
             return {"error": "Still starting up — try again in a moment."}
         with self._focus_lock:
             if self._focus_windows:
                 return {"error": "A focus block is already running."}
-            result = self._engine.focus_start(label, minutes, look_down, look_away)
-            if result.get("error"):
-                return result
+            return self._engine.focus_start(label, minutes, look_down, look_away)
+
+    def focus_open_windows(self) -> dict:
+        """Second half of the old focus_start(): blacks out every screen.
+        Called once the countdown popup has finished, and only when
+        focus_start() above returned no error."""
+        with self._focus_lock:
             try:
                 self._open_focus_windows()
             except Exception:
                 log.exception("failed to open focus windows")
-                self._engine.focus_cancel()
+                if self._engine is not None:
+                    self._engine.focus_cancel()
                 self._close_focus_windows()
                 return {"error": "Could not black out the screens — see logs/app.log."}
         return {"ok": True}
@@ -1186,6 +1202,78 @@ class Api:
                 log.exception("failed to exit mini mode")
         return {"ok": True}
 
+    # -- countdown popup --
+    def open_countdown_popup(self) -> dict:
+        """Hides the main window and shows the centered countdown popup.
+
+        Called right as Start/Focus is clicked, before the engine-side
+        start (which is what actually opens the camera and can itself take
+        up to 5s). The popup runs its own local 5s visual countdown, so
+        that latency happens hidden behind it instead of leaving the app
+        looking frozen."""
+        with self._countdown_lock:
+            try:
+                if self._main_window is not None:
+                    self._main_window.hide()
+                if self._countdown_window is not None:
+                    self._reposition_countdown()
+                    self._countdown_window.show()
+            except Exception:
+                log.exception("failed to open countdown popup")
+        return {"ok": True}
+
+    def close_countdown_popup(self) -> dict:
+        """Hides the popup only -- does not touch the main window, since
+        what should happen next (show main with an error, enter mini,
+        black out the screens for focus mode) depends on how the countdown
+        resolved and is decided by the caller."""
+        with self._countdown_lock:
+            try:
+                if self._countdown_window is not None:
+                    self._countdown_window.hide()
+            except Exception:
+                log.exception("failed to close countdown popup")
+        return {"ok": True}
+
+    def show_main(self) -> dict:
+        try:
+            if self._main_window is not None:
+                self._main_window.show()
+        except Exception:
+            log.exception("failed to restore main window")
+        return {"ok": True}
+
+    def _reposition_countdown(self) -> None:
+        """Center the popup on whatever screen the main window is currently
+        on. Same live-screen-lookup approach as _reposition_mini and for the
+        same reason: pywebview's cached screen is frozen at create_window()
+        time and can be wrong on a multi-monitor Mac."""
+        try:
+            from webview.platforms.cocoa import BrowserView
+            main_inst = BrowserView.instances.get(self._main_window.uid)
+            countdown_inst = BrowserView.instances.get(self._countdown_window.uid)
+            if main_inst is None or countdown_inst is None:
+                return
+
+            def _apply():
+                try:
+                    screen = main_inst.window.screen() or AppKit.NSScreen.mainScreen()
+                    frame = screen.frame()
+                    countdown_inst.screen = frame  # un-stales pywebview's cached screen
+
+                    size = countdown_inst.window.frame().size
+                    x = frame.origin.x + (frame.size.width - size.width) / 2
+                    y = frame.origin.y + (frame.size.height - size.height) / 2
+                    countdown_inst.window.setFrameOrigin_(AppKit.NSMakePoint(x, y))
+                    countdown_inst.window.setLevel_(AppKit.NSStatusWindowLevel)
+                    countdown_inst.window.makeKeyAndOrderFront_(None)
+                except Exception as e:
+                    log.debug("countdown window positioning failed: %s", e)
+
+            AppHelper.callAfter(_apply)
+        except Exception as e:
+            log.debug("countdown window positioning failed: %s", e)
+
 
 def main() -> None:
     _acquire_instance_lock()
@@ -1219,7 +1307,20 @@ def main() -> None:
         hidden=True,
         background_color="#0B0B0B",
     )
-    api._attach_windows(main_window, mini_window)
+    countdown_window = webview.create_window(
+        "Argus",
+        str(WEB_DIR / "countdown.html"),
+        js_api=api,
+        width=440,
+        height=280,
+        frameless=True,
+        easy_drag=False,
+        on_top=True,
+        resizable=False,
+        hidden=True,
+        background_color="#0B0B0B",
+    )
+    api._attach_windows(main_window, mini_window, countdown_window)
 
     def hide_on_close():
         # Clicking the red traffic-light button used to destroy main_window

@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Argus</title>
+<script>
+  (() => {
+    try {
+      const saved = localStorage.getItem('argus-theme');
+      const theme = saved === 'light' || saved === 'dark'
+        ? saved
+        : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+      document.documentElement.setAttribute('data-theme', theme);
+    } catch (e) {}
+  })();
+</script>
+<link rel="stylesheet" href="style.css">
+<style>
+  html, body {
+    height: 100%;
+    width: 100%;
+    overflow: hidden;
+    cursor: default;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+  .popup {
+    height: 100%;
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    border: 1px solid var(--line);
+    box-sizing: border-box;
+  }
+  .popup-brand {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--muted);
+  }
+  .popup-number {
+    font-family: var(--font-mono);
+    font-size: 86px;
+    font-weight: 500;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+    line-height: 1;
+    color: var(--ink);
+  }
+  .popup-bar {
+    width: 200px;
+    height: 3px;
+    background: var(--line);
+    overflow: hidden;
+  }
+  .popup-bar-fill {
+    height: 100%;
+    width: 100%;
+    background: var(--accent);
+    transform-origin: left center;
+  }
+</style>
+</head>
+<body>
+  <div class="popup">
+    <span class="popup-brand">Argus</span>
+    <div class="popup-number" id="popupNumber">5.00</div>
+    <div class="popup-bar"><div class="popup-bar-fill" id="popupBarFill"></div></div>
+  </div>
+
+<script>
+(() => {
+  const DURATION_MS = 5000;
+  const numberEl = document.getElementById('popupNumber');
+  const fillEl = document.getElementById('popupBarFill');
+  let start = null;
+
+  function frame(ts) {
+    if (start === null) start = ts;
+    const elapsed = ts - start;
+    const remaining = Math.max(0, DURATION_MS - elapsed) / 1000;
+    numberEl.textContent = remaining.toFixed(2);
+    fillEl.style.transform = `scaleX(${Math.max(0, remaining * 1000 / DURATION_MS)})`;
+    if (elapsed < DURATION_MS) {
+      requestAnimationFrame(frame);
+    }
+  }
+  requestAnimationFrame(frame);
+
+  // Every time the popup is shown again (pywebview re-shows a hidden
+  // window rather than recreating it), reset the run so a second session
+  // gets a fresh 5.00 -> 0.00 instead of freezing at 0.00.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      start = null;
+      requestAnimationFrame(frame);
+    }
+  });
+})();
+</script>
+</body>
+</html>

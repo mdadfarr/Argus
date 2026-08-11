@@ -109,6 +109,10 @@
       : 'calibrating… hold still and look at the screen';
   }
 
+  function delay(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
   function requireLabel() {
     if (labelInput.value.trim()) return true;
     statusMessage.textContent = 'Label is required.';
@@ -126,12 +130,29 @@
       // screens still black.
       if (!requireLabel()) return;
       for (const b of focusBtns) b.disabled = true;
+      const minutes = parseInt(btn.dataset.minutes, 10);
       try {
-        const res = await window.pywebview.api.focus_start(
-          labelInput.value, parseInt(btn.dataset.minutes, 10), lookDownOn, lookAwayOn
-        );
+        // Popup goes up first (hiding the main window), then the engine-side
+        // camera open runs behind it for the same fixed 5s the popup counts
+        // down -- the black screens themselves only appear once the popup is
+        // gone, via focus_open_windows() below.
+        await window.pywebview.api.open_countdown_popup();
+        const [res] = await Promise.all([
+          window.pywebview.api.focus_start(labelInput.value, minutes, lookDownOn, lookAwayOn),
+          delay(5000),
+        ]);
+        await window.pywebview.api.close_countdown_popup();
         if (res && res.error) {
+          await window.pywebview.api.show_main();
           statusMessage.textContent = res.error;
+          statusMessage.classList.add('error');
+          for (const b of focusBtns) b.disabled = false;
+          return;
+        }
+        const openRes = await window.pywebview.api.focus_open_windows();
+        if (openRes && openRes.error) {
+          await window.pywebview.api.show_main();
+          statusMessage.textContent = openRes.error;
           statusMessage.classList.add('error');
           for (const b of focusBtns) b.disabled = false;
           return;
@@ -139,6 +160,8 @@
         statusMessage.classList.remove('error');
         labelInput.classList.remove('error');
       } catch (e) {
+        await window.pywebview.api.close_countdown_popup();
+        await window.pywebview.api.show_main();
         for (const b of focusBtns) b.disabled = false;
       }
     });
@@ -148,22 +171,43 @@
     if (!apiReady) return;
     if (!requireLabel()) return;
     const minutes = parseFloat(minutesInput.value);
+    const minutesVal = isNaN(minutes) ? null : minutes;
     startBtn.disabled = true;
     try {
-      const res = await window.pywebview.api.start(
-        labelInput.value, isNaN(minutes) ? null : minutes, lookDownOn, cameraOn, lookAwayOn
-      );
-      if (res && res.error) {
-        statusMessage.textContent = res.error;
-        statusMessage.classList.add('error');
-        startBtn.disabled = false;
-        return;
+      // Only camera sessions need the camera to boot, so only they get the
+      // popup -- a timer-only session can start the instant it's asked to.
+      if (cameraOn) {
+        await window.pywebview.api.open_countdown_popup();
+        const [res] = await Promise.all([
+          window.pywebview.api.start(labelInput.value, minutesVal, lookDownOn, cameraOn, lookAwayOn),
+          delay(5000),
+        ]);
+        await window.pywebview.api.close_countdown_popup();
+        if (res && res.error) {
+          await window.pywebview.api.show_main();
+          statusMessage.textContent = res.error;
+          statusMessage.classList.add('error');
+          startBtn.disabled = false;
+          return;
+        }
+      } else {
+        const res = await window.pywebview.api.start(
+          labelInput.value, minutesVal, lookDownOn, cameraOn, lookAwayOn
+        );
+        if (res && res.error) {
+          statusMessage.textContent = res.error;
+          statusMessage.classList.add('error');
+          startBtn.disabled = false;
+          return;
+        }
       }
       statusMessage.classList.remove('error');
       labelInput.classList.remove('error');
       await window.pywebview.api.enter_mini();
       miniShown = true;
     } catch (e) {
+      await window.pywebview.api.close_countdown_popup();
+      await window.pywebview.api.show_main();
       startBtn.disabled = false;
     }
   });
