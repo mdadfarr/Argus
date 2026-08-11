@@ -3,12 +3,41 @@
 <head>
 <meta charset="UTF-8">
 <title>Argus Timer</title>
+<script>
+  (() => {
+    try {
+      const saved = localStorage.getItem('argus-theme');
+      const theme = saved === 'light' || saved === 'dark'
+        ? saved
+        : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+      document.documentElement.setAttribute('data-theme', theme);
+    } catch (e) {}
+  })();
+  // This window is created once at startup and only ever shown/hidden, never
+  // reloaded, so it would otherwise never see a theme flip made later in the
+  // main window. The 'storage' event fires in every other same-origin
+  // document when one of them calls localStorage.setItem, which is exactly
+  // what the toggle in app.js does.
+  window.addEventListener('storage', (e) => {
+    if (e.key === 'argus-theme' && (e.newValue === 'light' || e.newValue === 'dark')) {
+      document.documentElement.setAttribute('data-theme', e.newValue);
+    }
+  });
+</script>
 <style>
   :root {
     --bg: #0B0B0B;
     --ink: #FAFAFA;
     --accent: #E8231A;
     --pause: #E8A100;
+    --stroke-color: #2E2E2E;
+  }
+  :root[data-theme="light"] {
+    --bg: #FAFAFA;
+    --ink: #0B0B0B;
+    --accent: #E8231A;
+    --pause: #E8A100;
+    --stroke-color: #C7C7C7;
   }
   * { box-sizing: border-box; }
   html, body {
@@ -52,7 +81,7 @@
   }
   .stroke path {
     fill: none;
-    stroke: #2E2E2E;
+    stroke: var(--stroke-color);
     stroke-width: 1px;
   }
   /* Chromium 130+ can draw the squircle natively; when it can, skip the
@@ -60,7 +89,7 @@
   @supports (corner-shape: squircle) or (-webkit-corner-shape: squircle) {
     .wrap {
       clip-path: none;
-      border: 1px solid #2E2E2E;
+      border: 1px solid var(--stroke-color);
       border-radius: 10px;
       corner-shape: squircle;
       -webkit-corner-shape: squircle;

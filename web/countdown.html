@@ -13,6 +13,16 @@
       document.documentElement.setAttribute('data-theme', theme);
     } catch (e) {}
   })();
+  // Created once at startup and only ever shown/hidden, never reloaded, so
+  // it needs to hear about a theme flip made later in the main window. The
+  // 'storage' event fires in every other same-origin document when one of
+  // them calls localStorage.setItem, which is exactly what the toggle in
+  // app.js does.
+  window.addEventListener('storage', (e) => {
+    if (e.key === 'argus-theme' && (e.newValue === 'light' || e.newValue === 'dark')) {
+      document.documentElement.setAttribute('data-theme', e.newValue);
+    }
+  });
 </script>
 <link rel="stylesheet" href="style.css">
 <style>
