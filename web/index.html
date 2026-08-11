@@ -3,6 +3,17 @@
 <head>
 <meta charset="UTF-8">
 <title>Argus</title>
+<script>
+  (() => {
+    try {
+      const saved = localStorage.getItem('argus-theme');
+      const theme = saved === 'light' || saved === 'dark'
+        ? saved
+        : (window.matchMedia && window.matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+      document.documentElement.setAttribute('data-theme', theme);
+    } catch (e) {}
+  })();
+</script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -10,7 +21,12 @@
     <header class="topbar">
       <span class="brand">Argus</span>
       <button id="backToMiniBtn" class="link-btn" style="display:none">back to popup</button>
-      <span class="clock" id="clock">--:--:--</span>
+      <div class="topbar-right">
+        <button id="themeToggle" class="theme-toggle" type="button" aria-label="Toggle theme" title="Toggle theme">
+          <span id="themeToggleIcon">☾</span>
+        </button>
+        <span class="clock" id="clock">--:--:--</span>
+      </div>
     </header>
 
     <div class="banner" id="authBanner"></div>

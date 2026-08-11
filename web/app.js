@@ -23,6 +23,8 @@
   const thumbPlaceholder = el('thumbPlaceholder');
   const cameraStatus = el('cameraStatus');
   const backToMiniBtn = el('backToMiniBtn');
+  const themeToggle = el('themeToggle');
+  const themeToggleIcon = el('themeToggleIcon');
   const focusBtns = Array.from(document.querySelectorAll('.focus-btn'));
   const startBtn = el('startBtn');
   const pauseBtn = el('pauseBtn');
@@ -41,6 +43,18 @@
   let focusWasActive = false;
 
   function setToggle(btn, on) { btn.dataset.on = String(on); }
+
+  function applyTheme(theme) {
+    document.documentElement.setAttribute('data-theme', theme);
+    themeToggleIcon.textContent = theme === 'light' ? '☀' : '☾';
+  }
+  applyTheme(document.documentElement.getAttribute('data-theme') || 'dark');
+  themeToggle.addEventListener('click', () => {
+    const current = document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+    const next = current === 'light' ? 'dark' : 'light';
+    applyTheme(next);
+    try { localStorage.setItem('argus-theme', next); } catch (e) {}
+  });
 
   cameraToggle.addEventListener('click', () => {
     cameraOn = !cameraOn;

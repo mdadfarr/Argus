@@ -5,9 +5,37 @@
   --muted: #7C7C7C;
   --line: #262626;
   --rule: 1px solid #262626;
+  --field-line: #3A3A3A;
+  --placeholder: #565656;
+  --check-box-line: #5A5A5A;
+  --thumb-bg: #141414;
+  --thumb-line: #3A3A3A;
+  --btn-line: #3A3A3A;
+  --banner-plain-bg: #170A09;
+  --banner-plain-ink: #FF6A60;
   --font-sans: "Helvetica Neue", Inter, -apple-system, system-ui, Arial, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, monospace;
 }
+
+:root[data-theme="light"] {
+  --bg: #FAFAFA;
+  --ink: #0B0B0B;
+  --accent: #E8231A;
+  --muted: #6B6B6B;
+  --line: #E0E0E0;
+  --rule: 1px solid #E0E0E0;
+  --field-line: #C7C7C7;
+  --placeholder: #9A9A9A;
+  --check-box-line: #A0A0A0;
+  --thumb-bg: #EDEDED;
+  --thumb-line: #C7C7C7;
+  --btn-line: #C7C7C7;
+  --banner-plain-bg: #FDEDEB;
+  --banner-plain-ink: #B0161B;
+}
+
+html { background: var(--bg); }
+* { transition: background-color 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
 
 * { box-sizing: border-box; }
 
@@ -52,6 +80,27 @@ button, input { font-family: inherit; border-radius: 0; }
   width: auto;
   margin-top: 0;
 }
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.theme-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--btn-line);
+  background: transparent;
+  color: var(--ink);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  border-radius: 50%;
+}
+.theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
 
 /* ---------- hero ---------- */
 .hero {
@@ -105,8 +154,8 @@ button, input { font-family: inherit; border-radius: 0; }
 }
 .banner.visible { display: block; }
 .banner.plain {
-  background: #170A09;
-  color: #FF6A60;
+  background: var(--banner-plain-bg);
+  color: var(--banner-plain-ink);
   border-bottom: var(--rule);
   border-left: 3px solid var(--accent);
   text-transform: none;
@@ -131,14 +180,14 @@ button, input { font-family: inherit; border-radius: 0; }
 
 .field input {
   border: none;
-  border-bottom: 1px solid #3A3A3A;
+  border-bottom: 1px solid var(--field-line);
   background: transparent;
   color: var(--ink);
   padding: 5px 0 7px;
   font-size: 15px;
   outline: none;
 }
-.field input::placeholder { color: #565656; }
+.field input::placeholder { color: var(--placeholder); }
 .field input:focus { border-bottom: 2px solid var(--accent); padding-bottom: 6px; }
 .field input[type="number"] { font-family: var(--font-mono); }
 
@@ -158,7 +207,7 @@ button, input { font-family: inherit; border-radius: 0; }
   width: 14px;
   height: 14px;
   margin-top: 1px;
-  border: 1px solid #5A5A5A;
+  border: 1px solid var(--check-box-line);
   flex-shrink: 0;
   background: transparent;
 }
@@ -173,7 +222,7 @@ button, input { font-family: inherit; border-radius: 0; }
   font-size: 9px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: #565656;
+  color: var(--placeholder);
 }
 .diag-v {
   font-family: var(--font-mono);
@@ -198,11 +247,11 @@ button, input { font-family: inherit; border-radius: 0; }
 .thumb {
   width: 104px;
   height: 78px;
-  border: 1px solid #3A3A3A;
+  border: 1px solid var(--thumb-line);
   position: relative;
   overflow: hidden;
   flex-shrink: 0;
-  background: #141414;
+  background: var(--thumb-bg);
 }
 .thumb img {
   width: 100%;
@@ -222,7 +271,7 @@ button, input { font-family: inherit; border-radius: 0; }
   font-size: 9px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: #565656;
+  color: var(--placeholder);
 }
 .camera-meta { display: flex; flex-direction: column; gap: 6px; }
 .mono-small {
@@ -242,7 +291,7 @@ button, input { font-family: inherit; border-radius: 0; }
   letter-spacing: 0.12em;
   text-transform: uppercase;
   cursor: pointer;
-  border: 1px solid #3A3A3A;
+  border: 1px solid var(--btn-line);
   background: transparent;
   color: var(--ink);
   transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease;
