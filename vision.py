@@ -264,7 +264,13 @@ class VisionWorker(threading.Thread):
         self._open_result: bool | None = None
         self._open_seq = 0
         self._open_done_seq = 0
-        self._stop = threading.Event()
+        # NOT self._stop: threading.Thread defines its own _stop(), and
+        # Thread._wait_for_tstate_lock() calls it once the thread's state lock
+        # is released. Shadowing it with an Event made every join()/is_alive()
+        # on a finished worker raise "TypeError: 'Event' object is not
+        # callable" -- swallowed by shutdown()'s except-pass in main.py, so
+        # the join silently never confirmed the thread had actually stopped.
+        self._stop_event = threading.Event()
 
         # Calibration state is written by the tick thread (via SessionTimer's
         # callbacks) and read by this thread inside _read_once, so it needs the
@@ -432,18 +438,40 @@ class VisionWorker(threading.Thread):
 
     # ---------- main loop ----------
     def run(self) -> None:
-        while not self._stop.is_set():
+        try:
+            while not self._stop_event.is_set():
+                try:
+                    self._run_once()
+                except Exception:
+                    # Without this the thread dies for the whole life of the
+                    # process and nothing restarts it: request_open() then blocks
+                    # its full timeout and returns False forever, so the app spends
+                    # the rest of the run reporting "camera open did not complete
+                    # within 5.0s" with no hint of the real cause. Engine._loop has
+                    # the same guard for the same reason.
+                    log.exception("error in vision worker loop")
+                    time.sleep(0.5)
+        finally:
+            self._close_detectors()
+
+    def _close_detectors(self) -> None:
+        """Release the native MediaPipe graphs. Dropping the Python reference
+        does not free the TFLite interpreter behind them; close() does.
+
+        Called from run()'s finally rather than from stop() on purpose. detect()
+        only ever runs on this thread, so closing here cannot race a call that
+        is still in flight -- closing from the caller's thread could, and using
+        a closed task object is a native use-after-free, not a Python
+        exception. Same reasoning as the _cap_lock comment in _run_once."""
+        for name in ("face_landmarker", "phone_detector"):
+            detector = getattr(self, name)
+            if detector is None:
+                continue
             try:
-                self._run_once()
+                detector.close()
             except Exception:
-                # Without this the thread dies for the whole life of the
-                # process and nothing restarts it: request_open() then blocks
-                # its full timeout and returns False forever, so the app spends
-                # the rest of the run reporting "camera open did not complete
-                # within 5.0s" with no hint of the real cause. Engine._loop has
-                # the same guard for the same reason.
-                log.exception("error in vision worker loop")
-                time.sleep(0.5)
+                log.debug("%s close failed", name, exc_info=True)
+            setattr(self, name, None)
 
     def _take_open_request(self) -> int | None:
         """Claim a pending open request, if any, and return its sequence
@@ -533,7 +561,7 @@ class VisionWorker(threading.Thread):
                 pass
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
         self.request_close()
 
     def _read_once(self, cap: cv2.VideoCapture) -> FrameReading:
