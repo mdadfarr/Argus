@@ -86,6 +86,13 @@ class FrameReading:
     yaw_delta_deg: float | None = None        # smoothed |deviation| from baseline, sign-free
     phone_confidence: float = 0.0
     phone_detector_available: bool = True
+    # Gaze. All None unless detect_gaze is on AND a calibration loaded; every
+    # consumer must treat them as optional. Still no image data here -- these
+    # are coordinates and a name, nothing that could reconstruct a frame.
+    gaze_screen: str | None = None            # calibrated monitor being looked at
+    gaze_xy: tuple[float, float] | None = None  # pixels within that monitor
+    gaze_on_screen: bool = False
+    gaze_available: bool = False              # tracker loaded and running
 
 
 class SustainedCondition:
@@ -222,8 +229,18 @@ def open_camera(cfg: dict) -> cv2.VideoCapture:
     if not cap.isOpened():
         cap.release()
         raise CameraUnavailable(f"camera index {index} would not open")
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    # Gaze needs the capture resolution to match the one its camera intrinsics
+    # were solved at -- fx, fy, cx, cy are in pixels and do not transfer. When
+    # gaze is on we therefore capture at its calibrated size instead of the
+    # 640x480 the head-pose path is happy with. store.load_calibration refuses
+    # a mismatch anyway; this is what stops it ever being a mismatch.
+    if cfg.get("detect_gaze", False):
+        width = cfg.get("gaze_capture_width", 1280)
+        height = cfg.get("gaze_capture_height", 720)
+    else:
+        width, height = 640, 480
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     return cap
 
 
@@ -289,12 +306,19 @@ class VisionWorker(threading.Thread):
 
         self._tick_count = 0
         self._last_phone_confidence = 0.0
+        # Held between ticks for the same reason _last_phone_confidence is:
+        # gaze_every_n_ticks means most ticks skip inference, and reporting
+        # None on those would make every downstream sustain-counter flicker.
+        self._last_gaze: tuple[str | None, tuple[float, float] | None, bool] = (None, None, False)
 
         self.degraded: list[str] = []
         self.resolved_camera_name: str | None = None
         self.face_landmarker = None
         self.phone_detector = None
         self._load_models()
+
+        self.gaze_tracker = None
+        self._load_gaze()
 
     def _load_models(self) -> None:
         if _verify_model(FACE_MODEL_PATH, FACE_MODEL_SHA256):
@@ -327,6 +351,69 @@ class VisionWorker(threading.Thread):
                 self.phone_detector = None
             if self.phone_detector is None:
                 self.degraded.append("phone")
+
+    def _load_gaze(self) -> None:
+        """Build the gaze tracker, or record a degradation and carry on.
+
+        Every failure here is non-fatal by design. Gaze is an addition to
+        detection, never a precondition for it: torch may not be installed, the
+        checkpoint is a manual download, and the calibration does not exist
+        until tools/calibrate_screens.py has been run. In all of those cases
+        Argus must still start and still watch the desk with head pose alone.
+
+        The import is inside the function for the same reason -- torch is in
+        requirements-gaze.txt, not requirements.txt, so importing it at module
+        scope would break every install that never turns gaze on.
+        """
+        if not self.cfg.get("detect_gaze", False):
+            return
+
+        try:
+            from gaze.model import load_checkpoint, pick_device  # noqa: PLC0415
+            from gaze.store import load_calibration  # noqa: PLC0415
+            from gaze.tracker import GazeTracker  # noqa: PLC0415
+        except ImportError as e:
+            log.error("gaze enabled but its dependencies are missing (%s) -- "
+                      "install requirements-gaze.txt", e)
+            self.degraded.append("gaze")
+            return
+
+        checkpoint = ROOT / self.cfg["gaze_checkpoint_path"]
+        calibration_path = ROOT / self.cfg["gaze_calibration_path"]
+        try:
+            capture_size = (
+                self.cfg.get("gaze_capture_width", 1280),
+                self.cfg.get("gaze_capture_height", 720),
+            )
+            calibration = load_calibration(
+                calibration_path,
+                expect_capture_size=capture_size,
+                expect_checkpoint=checkpoint if checkpoint.exists() else None,
+            )
+            device = pick_device()
+            model = load_checkpoint(checkpoint, device)
+            self.gaze_tracker = GazeTracker(
+                model,
+                calibration.camera_matrix,
+                calibration.dist_coeffs,
+                calibration.screens,
+                device,
+                person_idx=self.cfg.get("gaze_person_idx", 0),
+            )
+            log.info("gaze tracking active on %s with %d calibrated screen(s): %s",
+                     device, len(calibration.screens),
+                     ", ".join(scr.name for scr in calibration.screens))
+        except Exception as e:
+            # Broad on purpose: a missing checkpoint, a stale calibration, a
+            # torch backend that will not initialise and a corrupt file all
+            # mean the same thing to the caller -- no gaze this run.
+            log.error("gaze unavailable: %s", e)
+            self.gaze_tracker = None
+            self.degraded.append("gaze")
+
+    @property
+    def gaze_available(self) -> bool:
+        return self.gaze_tracker is not None
 
     @property
     def phone_detector_available(self) -> bool:
@@ -384,6 +471,11 @@ class VisionWorker(threading.Thread):
             # on every tick that skips detection (phone_detect_every_n_ticks),
             # counting toward the new session's phone_sustain_seconds budget.
             self._last_phone_confidence = 0.0
+            self._last_gaze = (None, None, False)
+        if self.gaze_tracker is not None:
+            # Carrying a pose across a session boundary makes the first frames
+            # of the new session converge toward where the head used to be.
+            self.gaze_tracker.reset()
 
     def finish_calibration(self) -> bool:
         """Discards the first second of samples (settling time) and takes the
@@ -564,6 +656,40 @@ class VisionWorker(threading.Thread):
         self._stop_event.set()
         self.request_close()
 
+    def _run_gaze(self, rgb, face_result):
+        """Gaze for one frame, reusing the landmarks the face detector already
+        produced. Returns (screen_name, (x, y), on_screen).
+
+        Sharing the landmarks is the whole point of taking them as an argument
+        rather than letting the tracker find a face itself: upstream runs its
+        own MediaPipe FaceMesh, which here would mean detecting the same face
+        twice per tick.
+
+        Note the head pose is NOT shared. MediaPipe's transformation matrix is
+        expressed against its own assumed camera and is not metric; projecting
+        a gaze ray onto a screen plane needs real millimetres, which only
+        solvePnP against calibrated intrinsics gives.
+        """
+        n = max(1, self.cfg.get("gaze_every_n_ticks", 1))
+        if self._tick_count % n != 0:
+            return self._last_gaze
+
+        try:
+            landmarks = np.array([[lm.x, lm.y] for lm in face_result.face_landmarks[0]])
+            reading = self.gaze_tracker.update(rgb, landmarks)
+        except Exception:
+            # One bad frame must not take the session down, and must not leave
+            # a stale hit latched either -- report nothing until it recovers.
+            log.debug("gaze frame failed", exc_info=True)
+            self._last_gaze = (None, None, False)
+            return self._last_gaze
+
+        if not reading.ok:
+            self._last_gaze = (None, None, False)
+        else:
+            self._last_gaze = (reading.screen_name, reading.screen_xy, reading.on_any_screen)
+        return self._last_gaze
+
     def _read_once(self, cap: cv2.VideoCapture) -> FrameReading:
         ok, frame = cap.read()
         if not ok or frame is None:
@@ -608,6 +734,12 @@ class VisionWorker(threading.Thread):
                             self._yaw_ema = d if self._yaw_ema is None else (0.3 * d + 0.7 * self._yaw_ema)
                             yaw_delta = self._yaw_ema
 
+        gaze_screen = None
+        gaze_xy = None
+        gaze_on_screen = False
+        if self.gaze_tracker is not None and face_present:
+            gaze_screen, gaze_xy, gaze_on_screen = self._run_gaze(rgb, result)
+
         phone_confidence = self._last_phone_confidence
         if self.phone_detector is not None and self.cfg.get("detect_phone", True):
             n = max(1, self.cfg.get("phone_detect_every_n_ticks", 1))
@@ -628,6 +760,10 @@ class VisionWorker(threading.Thread):
             yaw_delta_deg=yaw_delta,
             phone_confidence=phone_confidence,
             phone_detector_available=self.phone_detector is not None,
+            gaze_screen=gaze_screen,
+            gaze_xy=gaze_xy,
+            gaze_on_screen=gaze_on_screen,
+            gaze_available=self.gaze_tracker is not None,
         )
 
 
