@@ -93,6 +93,8 @@ def _validate(cfg: dict) -> None:
         release = cfg[release_key] if default_release is None else cfg.get(release_key, default_release)
         _require(release < enter, f"{release_key} must be < {enter_key}")
 
+    _validate_gaze(cfg)
+
     _require(
         cfg["log_level"].upper() in ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"),
         f"log_level {cfg['log_level']!r} is not a valid logging level",
@@ -101,6 +103,38 @@ def _validate(cfg: dict) -> None:
     # existence on disk: Alarm.start() and main.VIOLATION_SOUNDS both already
     # degrade gracefully on a missing file, so refusing to launch over a
     # cosmetic sound would be worse than the problem.
+
+
+def _validate_gaze(cfg: dict) -> None:
+    """Validate the gaze block, but only when it is switched on.
+
+    The whole group is optional and absent from REQUIRED_KEYS on purpose: gaze
+    needs torch and a downloaded checkpoint (see requirements-gaze.txt), so an
+    install that never enables it must not be forced to carry the settings.
+    Once detect_gaze is true the paths are load-bearing, and a typo in one of
+    them would otherwise surface as a silent DEGRADED banner rather than a
+    refusal to launch -- which is the behaviour every other detector here has.
+    """
+    if not cfg.get("detect_gaze", False):
+        return
+
+    for key in ("gaze_checkpoint_path", "gaze_calibration_path"):
+        _require(key in cfg, f"detect_gaze is on but {key} is missing")
+        _require(bool(cfg[key]), f"{key} must not be empty when detect_gaze is on")
+        # Deliberately not checked for existence on disk. The calibration file
+        # legitimately does not exist until tools/calibrate_screens.py has been
+        # run once, and refusing to launch over that would strand the user with
+        # no way to produce it.
+
+    _require(
+        isinstance(cfg.get("gaze_person_idx", 0), int) and 0 <= cfg.get("gaze_person_idx", 0) < 30,
+        "gaze_person_idx must be an int in [0, 30) -- it indexes the model's "
+        "per-participant bias table, which has 15 participants x2 (mirrored)",
+    )
+    _require(cfg.get("gaze_every_n_ticks", 1) >= 1, "gaze_every_n_ticks must be >= 1")
+
+    for dim in ("gaze_capture_width", "gaze_capture_height"):
+        _require(cfg.get(dim, 0) > 0, f"{dim} must be > 0 when detect_gaze is on")
 
 
 def load_config(path: Path = DEFAULT_CONFIG_PATH) -> dict:
