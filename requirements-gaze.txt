@@ -1,0 +1,20 @@
+# Optional dependencies for the gaze tracker (gaze/, tools/, tests/test_gaze_*).
+#
+# Kept out of requirements.txt on purpose. Torch is a ~2 GB install and CI runs
+# `pip-audit -r requirements.txt --strict`, so folding it into the base set
+# would slow every run and make the audit gate depend on torch's advisory
+# history for a feature that is off by default.
+#
+# Install only when working on gaze:
+#     .venv/bin/pip install -r requirements-gaze.txt
+#
+# Without it, `detect_gaze` stays unavailable (the UI shows DEGRADED: GAZE) and
+# the gaze tests skip rather than fail.
+
+torch==2.6.0
+torchvision==0.21.0
+
+# macOS display enumeration: global desktop origins for multi-monitor. Without
+# it gaze/screens.py falls back to system_profiler, which reports resolution
+# but no origin -- fine for one screen, wrong for several.
+pyobjc-framework-Quartz==10.3.2

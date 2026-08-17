@@ -8,3 +8,5 @@ __pycache__/
 plan.md
 .pytest_cache/
 .ruff_cache/
+# Gaze model checkpoints are ~100MB and are downloaded, not authored.
+*.ckpt
