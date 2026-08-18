@@ -16,7 +16,6 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import yaml
 
 # Seven landmarks from MediaPipe's canonical face model (Apache-2.0), already
 # axis-corrected (y and z negated) and scaled from cm to mm. Eye corners first
@@ -59,6 +58,12 @@ def load_camera_matrix(path: str | Path) -> tuple[np.ndarray, np.ndarray]:
     exists for that, but re-running the calibration at the resolution you will
     actually capture is better.
     """
+    # Imported here rather than at module scope: PyYAML is only needed to read
+    # the intrinsics file, and hoisting it to the top made importing ANY of
+    # this package require it -- which broke the geometry and calibration tests
+    # on an install that had not pulled requirements-gaze.txt yet.
+    import yaml  # noqa: PLC0415
+
     data = yaml.safe_load(Path(path).read_text())
     try:
         camera_matrix = np.asarray(data["camera_matrix"], dtype=float).reshape(3, 3)

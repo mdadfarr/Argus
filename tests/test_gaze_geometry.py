@@ -12,7 +12,6 @@ import numpy as np
 import pytest
 
 cv2 = pytest.importorskip("cv2")
-pytest.importorskip("yaml")
 
 from gaze.geometry import (  # noqa: E402
     FACE_MODEL_7,

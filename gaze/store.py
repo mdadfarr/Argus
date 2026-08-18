@@ -154,3 +154,56 @@ def load_calibration(
         checkpoint_sha256=d.get("checkpoint_sha256"),
         created_at=d.get("created_at"),
     )
+
+
+# ---------- status, for the UI ----------
+
+# What the app needs to know is not "did it load" but "what should I tell the
+# user to do about it", so this returns a state plus a sentence rather than a
+# bool. A `DEGRADED: GAZE` banner that cannot distinguish "torch missing" from
+# "never calibrated" sends people to the wrong fix.
+STATUS_OK = "ok"
+STATUS_MISSING = "missing"          # never calibrated, or the file is empty
+STATUS_STALE = "stale"              # exists but no longer valid for this setup
+STATUS_NO_DEPS = "no_deps"          # torch et al not installed
+STATUS_DISABLED = "disabled"        # detect_gaze is off
+
+
+def calibration_status(
+    path: str | Path,
+    capture_size: tuple[int, int] | None = None,
+    checkpoint: str | Path | None = None,
+) -> dict:
+    """Describe the calibration without raising, for display in the UI.
+
+    Returns {state, message, screens, created_at}. `screens` is the list of
+    calibrated monitor names, which is what makes the difference between "you
+    calibrated" and "you calibrated the screen you are actually sitting at"
+    visible to someone with three monitors.
+    """
+    path = Path(path)
+    if not path.exists() or path.stat().st_size == 0:
+        return {
+            "state": STATUS_MISSING,
+            "message": "Not calibrated yet. Run calibration to tell Argus where your screens are.",
+            "screens": [],
+            "created_at": None,
+        }
+
+    try:
+        cal = load_calibration(path, expect_capture_size=capture_size, expect_checkpoint=checkpoint)
+    except CalibrationError as e:
+        return {
+            "state": STATUS_STALE,
+            "message": f"Calibration needs redoing: {e}",
+            "screens": [],
+            "created_at": None,
+        }
+
+    names = [s.name for s in cal.screens]
+    return {
+        "state": STATUS_OK,
+        "message": f"Calibrated for {len(names)} screen(s): {', '.join(names)}",
+        "screens": names,
+        "created_at": cal.created_at,
+    }
