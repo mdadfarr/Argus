@@ -33,6 +33,11 @@
   const statusMessage = el('statusMessage');
   const authBanner = el('authBanner');
   const degradedBanner = el('degradedBanner');
+  const gazeBand = el('gazeBand');
+  const gazeStatus = el('gazeStatus');
+  const gazeHint = el('gazeHint');
+  const gazeCalibrateBtn = el('gazeCalibrateBtn');
+  const dGaze = el('dGaze'), dGazeItem = el('dGazeItem');
 
   let apiReady = false;
   let cameraOn = true;
@@ -103,6 +108,14 @@
     };
     fmt(d.pitch, d.pitch_threshold, dPitch);
     fmt(d.yaw, d.yaw_threshold, dYaw);
+
+    if (d.gaze === null || d.gaze === undefined) {
+      dGazeItem.style.display = 'none';
+    } else {
+      dGazeItem.style.display = '';
+      dGaze.textContent = d.gaze;
+      dGaze.className = 'diag-v' + (d.gaze === 'off-screen' ? ' hot' : ' on');
+    }
 
     diagHint.textContent = d.calibrated
       ? `thresholds — phone ${d.phone_threshold}, down ${d.pitch_threshold}°, away ${d.yaw_threshold}°`
@@ -264,6 +277,7 @@
     }
 
     renderDiag(s.diag);
+    renderGaze(s.gaze);
 
     statusMessage.textContent = s.status_message || '';
     setBanner(authBanner, s.auth_warning, true);
@@ -328,4 +342,65 @@
 
   tickClock();
   poll();
+
+  // ---------- eye tracking ----------
+  function renderGaze(g) {
+    // The whole band stays hidden when detect_gaze is off, rather than showing
+    // a disabled control. A feature you have not switched on should not take up
+    // room explaining that it is not switched on.
+    if (!g || !g.enabled) {
+      gazeBand.style.display = 'none';
+      dGazeItem.style.display = 'none';
+      return;
+    }
+    gazeBand.style.display = '';
+
+    if (g.calibrating) {
+      gazeStatus.textContent = g.progress || 'Calibrating…';
+      gazeStatus.className = 'mono-small';
+      gazeCalibrateBtn.disabled = true;
+      gazeCalibrateBtn.textContent = 'Calibrating…';
+      gazeHint.textContent = 'Follow the dots on each screen. Move between rounds when asked.';
+      return;
+    }
+
+    gazeCalibrateBtn.textContent = g.needs_calibration ? 'Calibrate screens' : 'Recalibrate screens';
+    gazeCalibrateBtn.disabled = !g.can_calibrate;
+
+    // The result of the last attempt outranks the general status. A run that
+    // fails on a missing prerequisite takes well under a second, so if this
+    // only showed while `calibrating` was true the reason would flash past
+    // between polls and the button would look like it did nothing at all.
+    const lastResult = (!g.calibrating && g.progress) ? g.progress : '';
+    gazeStatus.textContent = lastResult || g.message || '';
+    gazeStatus.className = 'mono-small' +
+      ((g.needs_calibration || /failed|timed out/i.test(lastResult)) ? ' hot' : '');
+
+    if (g.state === 'no_deps') {
+      gazeHint.textContent = 'Install the gaze dependencies, then restart Argus.';
+    } else if (g.needs_calibration) {
+      gazeHint.textContent = 'Sessions still run without this — only eye tracking is affected.';
+    } else if (!g.can_calibrate) {
+      gazeHint.textContent = 'Stop the current session to recalibrate.';
+    } else {
+      gazeHint.textContent = '';
+    }
+
+    dGazeItem.style.display = (g.state === 'ok') ? '' : 'none';
+  }
+
+  gazeCalibrateBtn.addEventListener('click', async () => {
+    if (!apiReady) return;
+    gazeCalibrateBtn.disabled = true;
+    try {
+      const r = await window.pywebview.api.gaze_calibrate();
+      if (r && r.ok === false) {
+        statusMessage.textContent = r.error || 'Could not start calibration.';
+        statusMessage.classList.add('error');
+      }
+    } catch (e) {
+      statusMessage.textContent = 'Could not start calibration.';
+    }
+  });
+
 })();

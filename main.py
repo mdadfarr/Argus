@@ -6,6 +6,7 @@ import io
 import logging
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -26,7 +27,8 @@ import outbox
 import vision
 from timer import SessionTimer, State
 
-STATE = Path(__file__).parent / "state"
+ROOT = Path(__file__).parent
+STATE = ROOT / "state"
 STATE.mkdir(exist_ok=True)
 
 _lock_fh = None
@@ -131,6 +133,13 @@ def _install_excepthooks() -> None:
     threading.excepthook = thread_hook
 
 
+# Corner-look calibration is four rounds across every monitor, and the user is
+# asked to change position between rounds -- unhurried, it runs several
+# minutes. The timeout only exists so a subprocess that hangs on a camera that
+# never opens cannot leave the app permanently mid-calibration.
+GAZE_CALIBRATION_TIMEOUT_S = 900
+
+
 class Engine:
     """Owns all backend state (timer, vision worker, alarm, sync) and runs the
     tick loop on its own thread. Every method touching shared state takes
@@ -150,6 +159,8 @@ class Engine:
         self.thumbnail_b64: str | None = None
         self._syncing = True
         self._stopping = False
+        self._gaze_calibrating = False
+        self._gaze_calib_message = ""
         # Result of a camera open already performed outside self.lock, waiting
         # to be consumed by the next _open_camera() call. See _prewarm_camera.
         self._camera_open_hint: bool | None = None
@@ -705,7 +716,135 @@ class Engine:
             "yaw": None if r.yaw_delta_deg is None else round(r.yaw_delta_deg, 1),
             "yaw_threshold": self.cfg.get("look_away_enter_delta_degrees", 28),
             "calibrated": self.worker.calibrated,
+            "gaze": (
+                None if not r.gaze_available
+                else (r.gaze_screen if r.gaze_on_screen else "off-screen")
+            ),
         }
+
+    # ---------- gaze calibration ----------
+    def gaze_snapshot(self) -> dict:
+        """Everything the UI needs to decide what to say about gaze.
+
+        `blocks_start` is the interesting field. Gaze being uncalibrated does
+        NOT stop a session -- head-pose detection is unaffected and stopping
+        would punish the user for a feature they may not have set up yet -- but
+        the UI does need to say so, because silently running with the feature
+        you switched on doing nothing is worse than a nag.
+        """
+        with self.lock:
+            running = self._gaze_calibrating
+        status = self.worker.gaze_status()
+        return {
+            "enabled": bool(self.cfg.get("detect_gaze", False)),
+            "state": status.get("state", "disabled"),
+            "message": status.get("message", ""),
+            "calibrating": running,
+            "progress": self._gaze_calib_message,
+            "needs_calibration": status.get("state") in ("missing", "stale"),
+            "can_calibrate": (
+                bool(self.cfg.get("detect_gaze", False))
+                and status.get("state") != "no_deps"
+                and not running
+                and not self.session_active
+                and self.focus is None
+            ),
+        }
+
+    def gaze_calibrate(self) -> dict:
+        """Run the corner-look calibration, then reload the tracker.
+
+        Spawned as a subprocess rather than driven in-process. The calibration
+        needs fullscreen windows on every monitor and exclusive use of the
+        camera; doing that inside the running app would mean interleaving a
+        second Tk event loop with pywebview's and handing the capture device
+        back and forth mid-session. A separate process gets both for free, and
+        a crash in it cannot take the timer down.
+        """
+        with self.lock:
+            if self._gaze_calibrating:
+                return {"ok": False, "error": "Calibration is already running."}
+            if self.session_active or self.focus is not None:
+                return {"ok": False, "error": "Stop the current session before calibrating."}
+            if not self.cfg.get("detect_gaze", False):
+                return {"ok": False, "error": "Turn on detect_gaze in config.json first."}
+            self._gaze_calibrating = True
+            self._gaze_calib_message = "Starting…"
+
+        threading.Thread(target=self._run_gaze_calibration, daemon=True).start()
+        return {"ok": True}
+
+    def _run_gaze_calibration(self) -> None:
+        checkpoint = ROOT / self.cfg["gaze_checkpoint_path"]
+        calibration = ROOT / self.cfg["gaze_calibration_path"]
+        face_model = ROOT / "models" / "face_landmarker.task"
+
+        camera_matrix = ROOT / self.cfg.get("gaze_camera_matrix_path", "state/camera_matrix.yaml")
+
+        try:
+            # Check every prerequisite up front. Each of these otherwise fails
+            # deep inside the subprocess, where the user sees a traceback
+            # instead of the one sentence telling them what to go and do.
+            if not checkpoint.exists():
+                raise FileNotFoundError(
+                    f"Model checkpoint not found at {checkpoint.name}. Download p00.ckpt "
+                    "and put it in state/ (see gaze/README.md)."
+                )
+            if not camera_matrix.exists():
+                raise FileNotFoundError(
+                    "Camera not calibrated yet. Run tools/calibrate_camera.py first "
+                    "(you need a printed chessboard) to create state/camera_matrix.yaml."
+                )
+            if not face_model.exists():
+                raise FileNotFoundError(f"Face model missing at {face_model.name}.")
+
+            # The worker holds the capture device, and macOS will not hand the
+            # same camera to a second process while it is open. Releasing here
+            # is what makes the subprocess able to start at all.
+            self._set_gaze_progress("Releasing the camera…")
+            self.worker.request_close()
+            time.sleep(0.5)
+
+            self._set_gaze_progress("Follow the targets on each screen…")
+            proc = subprocess.run(
+                [
+                    sys.executable, str(ROOT / "tools" / "calibrate_screens.py"),
+                    "--camera-matrix", str(camera_matrix),
+                    "--checkpoint", str(checkpoint),
+                    "--face-model", str(face_model),
+                    "--output", str(calibration),
+                    "--camera", str(self.cfg.get("camera_index", 0)),
+                    "--width", str(self.cfg.get("gaze_capture_width", 1280)),
+                    "--height", str(self.cfg.get("gaze_capture_height", 720)),
+                    "--person-idx", str(self.cfg.get("gaze_person_idx", 0)),
+                    "--bootstrap",
+                ],
+                capture_output=True, text=True, timeout=GAZE_CALIBRATION_TIMEOUT_S,
+            )
+            if proc.returncode != 0:
+                tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+                raise RuntimeError(tail[-1] if tail else f"calibration exited {proc.returncode}")
+
+            log.info("gaze calibration output:\n%s", proc.stdout)
+            self._set_gaze_progress("Reloading…")
+            status = self.worker.reload_gaze()
+            self._set_gaze_progress(status.get("message", "Done."))
+        except subprocess.TimeoutExpired:
+            log.error("gaze calibration timed out")
+            self._set_gaze_progress("Calibration timed out.")
+        except Exception as e:
+            # Deliberately not log.exception: the traceback is noise for a
+            # missing-file case, and the message is the whole point.
+            log.error("gaze calibration failed: %s", e)
+            self._set_gaze_progress(f"Calibration failed: {e}")
+        finally:
+            with self.lock:
+                self._gaze_calibrating = False
+
+    def _set_gaze_progress(self, message: str) -> None:
+        with self.lock:
+            self._gaze_calib_message = message
+        log.info("gaze calibration: %s", message)
 
     # ---------- snapshot for JS polling ----------
     def snapshot(self) -> dict:
@@ -752,6 +891,17 @@ class Engine:
             else:
                 status_message = self.status_message
 
+            if not status_message and self.cfg.get("detect_gaze", False):
+                last = self._gaze_calib_message
+                gaze_state = self.worker.gaze_status().get("state")
+                if last.startswith("Calibration failed") or last.startswith("Calibration timed out"):
+                    status_message = last
+                elif gaze_state in ("missing", "stale"):
+                    status_message = (
+                        "Eye tracking is on but your screens are not calibrated yet — "
+                        "use Calibrate screens below."
+                    )
+
             degraded = ""
             if camera_on and self.worker.degraded:
                 degraded = (
@@ -779,6 +929,7 @@ class Engine:
                 "default_minutes": self.cfg["pomodoro_minutes"],
                 "dry_run": bool(self.cfg["dry_run"]),
                 "diag": self._diagnostics(camera_on),
+                "gaze": self.gaze_snapshot(),
                 "buttons": {
                     "start_enabled": (
                         state == State.IDLE and not self._syncing and self.focus is None
@@ -898,6 +1049,17 @@ class Api:
 
     def false_positive(self) -> dict:
         return {"ok": True} if self._engine is None else self._engine.false_positive()
+
+    def gaze_calibrate(self) -> dict:
+        if self._engine is None:
+            return {"ok": False, "error": self._boot_error or "not ready"}
+        return self._engine.gaze_calibrate()
+
+    def gaze_state(self) -> dict:
+        if self._engine is None:
+            return {"enabled": False, "state": "disabled", "message": "", "calibrating": False,
+                    "needs_calibration": False, "can_calibrate": False, "progress": ""}
+        return self._engine.gaze_snapshot()
 
     def get_state(self) -> dict:
         if self._engine is not None:

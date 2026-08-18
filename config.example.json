@@ -37,6 +37,7 @@
   "phone_detect_every_n_ticks": 2,
   "detect_gaze": false,
   "gaze_checkpoint_path": "state/p00.ckpt",
+  "gaze_camera_matrix_path": "state/camera_matrix.yaml",
   "gaze_calibration_path": "state/gaze_calibration.json",
   "gaze_person_idx": 0,
   "gaze_every_n_ticks": 2,

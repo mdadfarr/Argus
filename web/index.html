@@ -92,6 +92,17 @@
       </div>
     </section>
 
+    <section class="band" id="gazeBand" style="display:none">
+      <span class="label">Eye tracking</span>
+      <div class="camera-meta">
+        <span id="gazeStatus" class="mono-small">checking…</span>
+      </div>
+      <div class="controls" style="margin-top:8px">
+        <button id="gazeCalibrateBtn" class="btn btn-secondary" type="button">Calibrate screens</button>
+      </div>
+      <span class="check-note" id="gazeHint"></span>
+    </section>
+
     <section class="band" id="diagBand">
       <span class="label">Live detection</span>
       <div class="diag" id="diag">
@@ -99,6 +110,7 @@
         <div class="diag-item"><span class="diag-k">phone</span><span class="diag-v" id="dPhone">—</span></div>
         <div class="diag-item"><span class="diag-k">down</span><span class="diag-v" id="dPitch">—</span></div>
         <div class="diag-item"><span class="diag-k">away</span><span class="diag-v" id="dYaw">—</span></div>
+        <div class="diag-item" id="dGazeItem" style="display:none"><span class="diag-k">gaze</span><span class="diag-v" id="dGaze">—</span></div>
       </div>
       <span class="check-note" id="diagHint">Starts reporting once a session is running.</span>
     </section>

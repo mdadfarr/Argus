@@ -318,6 +318,7 @@ class VisionWorker(threading.Thread):
         self._load_models()
 
         self.gaze_tracker = None
+        self._gaze_status: dict = {"state": "disabled", "message": "Gaze detection is off."}
         self._load_gaze()
 
     def _load_models(self) -> None:
@@ -366,6 +367,7 @@ class VisionWorker(threading.Thread):
         scope would break every install that never turns gaze on.
         """
         if not self.cfg.get("detect_gaze", False):
+            self._gaze_status = {"state": "disabled", "message": "Gaze detection is off."}
             return
 
         try:
@@ -375,7 +377,12 @@ class VisionWorker(threading.Thread):
         except ImportError as e:
             log.error("gaze enabled but its dependencies are missing (%s) -- "
                       "install requirements-gaze.txt", e)
-            self.degraded.append("gaze")
+            self._gaze_status = {
+                "state": "no_deps",
+                "message": "Gaze needs extra packages. Run: "
+                           ".venv/bin/pip install -r requirements-gaze.txt",
+            }
+            self._degrade_gaze()
             return
 
         checkpoint = ROOT / self.cfg["gaze_checkpoint_path"]
@@ -400,6 +407,15 @@ class VisionWorker(threading.Thread):
                 device,
                 person_idx=self.cfg.get("gaze_person_idx", 0),
             )
+            self._gaze_status = {
+                "state": "ok",
+                "message": "Calibrated for {} screen(s): {}".format(
+                    len(calibration.screens),
+                    ", ".join(scr.name for scr in calibration.screens),
+                ),
+            }
+            if "gaze" in self.degraded:
+                self.degraded.remove("gaze")
             log.info("gaze tracking active on %s with %d calibrated screen(s): %s",
                      device, len(calibration.screens),
                      ", ".join(scr.name for scr in calibration.screens))
@@ -409,7 +425,31 @@ class VisionWorker(threading.Thread):
             # mean the same thing to the caller -- no gaze this run.
             log.error("gaze unavailable: %s", e)
             self.gaze_tracker = None
+            try:
+                from gaze.store import calibration_status  # noqa: PLC0415
+                self._gaze_status = calibration_status(calibration_path, capture_size)
+            except Exception:
+                self._gaze_status = {"state": "stale", "message": str(e)}
+            self._degrade_gaze()
+
+    def _degrade_gaze(self) -> None:
+        if "gaze" not in self.degraded:
             self.degraded.append("gaze")
+
+    def gaze_status(self) -> dict:
+        """What to tell the user about gaze right now. Never raises."""
+        return dict(self._gaze_status)
+
+    def reload_gaze(self) -> dict:
+        """Re-read the calibration and rebuild the tracker.
+
+        Exists so finishing a calibration takes effect immediately. Requiring a
+        restart to pick up a file the app itself just caused to be written
+        would read as the calibration having failed.
+        """
+        self.gaze_tracker = None
+        self._load_gaze()
+        return self.gaze_status()
 
     @property
     def gaze_available(self) -> bool:
