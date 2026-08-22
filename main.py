@@ -6,7 +6,6 @@ import io
 import logging
 import os
 import queue
-import subprocess
 import sys
 import threading
 import time
@@ -27,8 +26,7 @@ import outbox
 import vision
 from timer import SessionTimer, State
 
-ROOT = Path(__file__).parent
-STATE = ROOT / "state"
+STATE = Path(__file__).parent / "state"
 STATE.mkdir(exist_ok=True)
 
 _lock_fh = None
@@ -42,12 +40,8 @@ def _acquire_instance_lock() -> None:
     could be tested at all.
     """
     global _lock_fh
-    # Opened "a+", not "w": "w" truncates before flock is attempted, so a
-    # second instance would wipe the running instance's recorded PID on the
-    # way out.
-    # noqa justification: the handle must stay open for the process
-    # lifetime -- closing it releases the flock.
-    _lock_fh = open(STATE / "instance.lock", "a+")  # noqa: SIM115
+
+    _lock_fh = open(STATE / "instance.lock", "a+")  
     try:
         fcntl.flock(_lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -66,10 +60,7 @@ SOUNDS_DIR = Path(__file__).parent / "sounds"
 VIOLATION_SOUNDS = {
     "left": SOUNDS_DIR / "left_room.aiff",
     "look_down": SOUNDS_DIR / "looked_down.aiff",
-    # Reuses looked_down.aiff rather than the synthesized looked_away.aiff --
-    # that file was hand-built and unverifiable outside macOS, so it's safer
-    # to point at a real, known-working sound. Drop sounds/looked_away.aiff
-    # in and flip this back if you'd rather have a distinct sound later.
+ 
     "look_away": SOUNDS_DIR / "looked_down.aiff",
     "phone": SOUNDS_DIR / "phone_detected.aiff",
 }
@@ -83,19 +74,12 @@ HEADLINES = {
     State.CAMERA_ERROR: "camera error",
 }
 
-# States in which a session is over and the UI should be back to its resting
-# layout (main window visible, mini hidden, start enabled).
 TERMINAL_UI_STATES = (State.IDLE, State.LOGGING, State.FAILED, State.ABORTED)
 
-# How often the tick loop retries anything left in the outbox. Long enough that
-# a sustained outage isn't hammered, short enough that coming back online during
-# a work day actually syncs the sessions queued while it was down.
 DRAIN_INTERVAL_S = 300.0
 # Wait between reopen attempts after the camera drops mid focus block.
 FOCUS_REOPEN_INTERVAL_S = 2.0
-# How long the black windows may stay up after the engine says the block is
-# over before the watchdog closes them itself. Long enough that the normal
-# focus.js teardown always wins.
+
 FOCUS_TEARDOWN_GRACE_S = 4.0
 
 
@@ -133,13 +117,6 @@ def _install_excepthooks() -> None:
     threading.excepthook = thread_hook
 
 
-# Corner-look calibration is four rounds across every monitor, and the user is
-# asked to change position between rounds -- unhurried, it runs several
-# minutes. The timeout only exists so a subprocess that hangs on a camera that
-# never opens cannot leave the app permanently mid-calibration.
-GAZE_CALIBRATION_TIMEOUT_S = 900
-
-
 class Engine:
     """Owns all backend state (timer, vision worker, alarm, sync) and runs the
     tick loop on its own thread. Every method touching shared state takes
@@ -159,8 +136,6 @@ class Engine:
         self.thumbnail_b64: str | None = None
         self._syncing = True
         self._stopping = False
-        self._gaze_calibrating = False
-        self._gaze_calib_message = ""
         # Result of a camera open already performed outside self.lock, waiting
         # to be consumed by the next _open_camera() call. See _prewarm_camera.
         self._camera_open_hint: bool | None = None
@@ -716,135 +691,7 @@ class Engine:
             "yaw": None if r.yaw_delta_deg is None else round(r.yaw_delta_deg, 1),
             "yaw_threshold": self.cfg.get("look_away_enter_delta_degrees", 28),
             "calibrated": self.worker.calibrated,
-            "gaze": (
-                None if not r.gaze_available
-                else (r.gaze_screen if r.gaze_on_screen else "off-screen")
-            ),
         }
-
-    # ---------- gaze calibration ----------
-    def gaze_snapshot(self) -> dict:
-        """Everything the UI needs to decide what to say about gaze.
-
-        `blocks_start` is the interesting field. Gaze being uncalibrated does
-        NOT stop a session -- head-pose detection is unaffected and stopping
-        would punish the user for a feature they may not have set up yet -- but
-        the UI does need to say so, because silently running with the feature
-        you switched on doing nothing is worse than a nag.
-        """
-        with self.lock:
-            running = self._gaze_calibrating
-        status = self.worker.gaze_status()
-        return {
-            "enabled": bool(self.cfg.get("detect_gaze", False)),
-            "state": status.get("state", "disabled"),
-            "message": status.get("message", ""),
-            "calibrating": running,
-            "progress": self._gaze_calib_message,
-            "needs_calibration": status.get("state") in ("missing", "stale"),
-            "can_calibrate": (
-                bool(self.cfg.get("detect_gaze", False))
-                and status.get("state") != "no_deps"
-                and not running
-                and not self.session_active
-                and self.focus is None
-            ),
-        }
-
-    def gaze_calibrate(self) -> dict:
-        """Run the corner-look calibration, then reload the tracker.
-
-        Spawned as a subprocess rather than driven in-process. The calibration
-        needs fullscreen windows on every monitor and exclusive use of the
-        camera; doing that inside the running app would mean interleaving a
-        second Tk event loop with pywebview's and handing the capture device
-        back and forth mid-session. A separate process gets both for free, and
-        a crash in it cannot take the timer down.
-        """
-        with self.lock:
-            if self._gaze_calibrating:
-                return {"ok": False, "error": "Calibration is already running."}
-            if self.session_active or self.focus is not None:
-                return {"ok": False, "error": "Stop the current session before calibrating."}
-            if not self.cfg.get("detect_gaze", False):
-                return {"ok": False, "error": "Turn on detect_gaze in config.json first."}
-            self._gaze_calibrating = True
-            self._gaze_calib_message = "Starting…"
-
-        threading.Thread(target=self._run_gaze_calibration, daemon=True).start()
-        return {"ok": True}
-
-    def _run_gaze_calibration(self) -> None:
-        checkpoint = ROOT / self.cfg["gaze_checkpoint_path"]
-        calibration = ROOT / self.cfg["gaze_calibration_path"]
-        face_model = ROOT / "models" / "face_landmarker.task"
-
-        camera_matrix = ROOT / self.cfg.get("gaze_camera_matrix_path", "state/camera_matrix.yaml")
-
-        try:
-            # Check every prerequisite up front. Each of these otherwise fails
-            # deep inside the subprocess, where the user sees a traceback
-            # instead of the one sentence telling them what to go and do.
-            if not checkpoint.exists():
-                raise FileNotFoundError(
-                    f"Model checkpoint not found at {checkpoint.name}. Download p00.ckpt "
-                    "and put it in state/ (see gaze/README.md)."
-                )
-            if not camera_matrix.exists():
-                raise FileNotFoundError(
-                    "Camera not calibrated yet. Run tools/calibrate_camera.py first "
-                    "(you need a printed chessboard) to create state/camera_matrix.yaml."
-                )
-            if not face_model.exists():
-                raise FileNotFoundError(f"Face model missing at {face_model.name}.")
-
-            # The worker holds the capture device, and macOS will not hand the
-            # same camera to a second process while it is open. Releasing here
-            # is what makes the subprocess able to start at all.
-            self._set_gaze_progress("Releasing the camera…")
-            self.worker.request_close()
-            time.sleep(0.5)
-
-            self._set_gaze_progress("Follow the targets on each screen…")
-            proc = subprocess.run(
-                [
-                    sys.executable, str(ROOT / "tools" / "calibrate_screens.py"),
-                    "--camera-matrix", str(camera_matrix),
-                    "--checkpoint", str(checkpoint),
-                    "--face-model", str(face_model),
-                    "--output", str(calibration),
-                    "--camera", str(self.cfg.get("camera_index", 0)),
-                    "--width", str(self.cfg.get("gaze_capture_width", 1280)),
-                    "--height", str(self.cfg.get("gaze_capture_height", 720)),
-                    "--person-idx", str(self.cfg.get("gaze_person_idx", 0)),
-                    "--bootstrap",
-                ],
-                capture_output=True, text=True, timeout=GAZE_CALIBRATION_TIMEOUT_S,
-            )
-            if proc.returncode != 0:
-                tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-                raise RuntimeError(tail[-1] if tail else f"calibration exited {proc.returncode}")
-
-            log.info("gaze calibration output:\n%s", proc.stdout)
-            self._set_gaze_progress("Reloading…")
-            status = self.worker.reload_gaze()
-            self._set_gaze_progress(status.get("message", "Done."))
-        except subprocess.TimeoutExpired:
-            log.error("gaze calibration timed out")
-            self._set_gaze_progress("Calibration timed out.")
-        except Exception as e:
-            # Deliberately not log.exception: the traceback is noise for a
-            # missing-file case, and the message is the whole point.
-            log.error("gaze calibration failed: %s", e)
-            self._set_gaze_progress(f"Calibration failed: {e}")
-        finally:
-            with self.lock:
-                self._gaze_calibrating = False
-
-    def _set_gaze_progress(self, message: str) -> None:
-        with self.lock:
-            self._gaze_calib_message = message
-        log.info("gaze calibration: %s", message)
 
     # ---------- snapshot for JS polling ----------
     def snapshot(self) -> dict:
@@ -891,17 +738,6 @@ class Engine:
             else:
                 status_message = self.status_message
 
-            if not status_message and self.cfg.get("detect_gaze", False):
-                last = self._gaze_calib_message
-                gaze_state = self.worker.gaze_status().get("state")
-                if last.startswith("Calibration failed") or last.startswith("Calibration timed out"):
-                    status_message = last
-                elif gaze_state in ("missing", "stale"):
-                    status_message = (
-                        "Eye tracking is on but your screens are not calibrated yet — "
-                        "use Calibrate screens below."
-                    )
-
             degraded = ""
             if camera_on and self.worker.degraded:
                 degraded = (
@@ -929,7 +765,6 @@ class Engine:
                 "default_minutes": self.cfg["pomodoro_minutes"],
                 "dry_run": bool(self.cfg["dry_run"]),
                 "diag": self._diagnostics(camera_on),
-                "gaze": self.gaze_snapshot(),
                 "buttons": {
                     "start_enabled": (
                         state == State.IDLE and not self._syncing and self.focus is None
@@ -1014,14 +849,11 @@ class Api:
         self._mini_lock = threading.Lock()
         self._focus_windows: list = []
         self._focus_lock = threading.Lock()
-        self._countdown_window = None
-        self._countdown_lock = threading.Lock()
 
     # -- wiring (called from main(), never from JS) --
-    def _attach_windows(self, main_window, mini_window, countdown_window) -> None:
+    def _attach_windows(self, main_window, mini_window) -> None:
         self._main_window = main_window
         self._mini_window = mini_window
-        self._countdown_window = countdown_window
 
     def _attach_engine(self, engine: Engine) -> None:
         self._engine = engine
@@ -1050,17 +882,6 @@ class Api:
     def false_positive(self) -> dict:
         return {"ok": True} if self._engine is None else self._engine.false_positive()
 
-    def gaze_calibrate(self) -> dict:
-        if self._engine is None:
-            return {"ok": False, "error": self._boot_error or "not ready"}
-        return self._engine.gaze_calibrate()
-
-    def gaze_state(self) -> dict:
-        if self._engine is None:
-            return {"enabled": False, "state": "disabled", "message": "", "calibrating": False,
-                    "needs_calibration": False, "can_calibrate": False, "progress": ""}
-        return self._engine.gaze_snapshot()
-
     def get_state(self) -> dict:
         if self._engine is not None:
             return self._engine.snapshot()
@@ -1079,32 +900,19 @@ class Api:
     # -- focus mode --
     def focus_start(self, label: str, minutes, look_down: bool = False,
                     look_away: bool = True) -> dict:
-        """Engine-side start only -- does NOT open the black windows.
-
-        Split out from window-opening so the countdown popup flow (see
-        open_countdown_popup) can run this during its 5s countdown -- which
-        is when the up-to-5s camera open actually happens -- and only pop
-        the black screens up once the popup itself has closed, via
-        focus_open_windows(). Calling this while the popup is still up would
-        otherwise put the blackout behind the popup mid-countdown."""
         if self._engine is None:
             return {"error": "Still starting up — try again in a moment."}
         with self._focus_lock:
             if self._focus_windows:
                 return {"error": "A focus block is already running."}
-            return self._engine.focus_start(label, minutes, look_down, look_away)
-
-    def focus_open_windows(self) -> dict:
-        """Second half of the old focus_start(): blacks out every screen.
-        Called once the countdown popup has finished, and only when
-        focus_start() above returned no error."""
-        with self._focus_lock:
+            result = self._engine.focus_start(label, minutes, look_down, look_away)
+            if result.get("error"):
+                return result
             try:
                 self._open_focus_windows()
             except Exception:
                 log.exception("failed to open focus windows")
-                if self._engine is not None:
-                    self._engine.focus_cancel()
+                self._engine.focus_cancel()
                 self._close_focus_windows()
                 return {"error": "Could not black out the screens — see logs/app.log."}
         return {"ok": True}
@@ -1364,78 +1172,6 @@ class Api:
                 log.exception("failed to exit mini mode")
         return {"ok": True}
 
-    # -- countdown popup --
-    def open_countdown_popup(self) -> dict:
-        """Hides the main window and shows the centered countdown popup.
-
-        Called right as Start/Focus is clicked, before the engine-side
-        start (which is what actually opens the camera and can itself take
-        up to 5s). The popup runs its own local 5s visual countdown, so
-        that latency happens hidden behind it instead of leaving the app
-        looking frozen."""
-        with self._countdown_lock:
-            try:
-                if self._main_window is not None:
-                    self._main_window.hide()
-                if self._countdown_window is not None:
-                    self._reposition_countdown()
-                    self._countdown_window.show()
-            except Exception:
-                log.exception("failed to open countdown popup")
-        return {"ok": True}
-
-    def close_countdown_popup(self) -> dict:
-        """Hides the popup only -- does not touch the main window, since
-        what should happen next (show main with an error, enter mini,
-        black out the screens for focus mode) depends on how the countdown
-        resolved and is decided by the caller."""
-        with self._countdown_lock:
-            try:
-                if self._countdown_window is not None:
-                    self._countdown_window.hide()
-            except Exception:
-                log.exception("failed to close countdown popup")
-        return {"ok": True}
-
-    def show_main(self) -> dict:
-        try:
-            if self._main_window is not None:
-                self._main_window.show()
-        except Exception:
-            log.exception("failed to restore main window")
-        return {"ok": True}
-
-    def _reposition_countdown(self) -> None:
-        """Center the popup on whatever screen the main window is currently
-        on. Same live-screen-lookup approach as _reposition_mini and for the
-        same reason: pywebview's cached screen is frozen at create_window()
-        time and can be wrong on a multi-monitor Mac."""
-        try:
-            from webview.platforms.cocoa import BrowserView
-            main_inst = BrowserView.instances.get(self._main_window.uid)
-            countdown_inst = BrowserView.instances.get(self._countdown_window.uid)
-            if main_inst is None or countdown_inst is None:
-                return
-
-            def _apply():
-                try:
-                    screen = main_inst.window.screen() or AppKit.NSScreen.mainScreen()
-                    frame = screen.frame()
-                    countdown_inst.screen = frame  # un-stales pywebview's cached screen
-
-                    size = countdown_inst.window.frame().size
-                    x = frame.origin.x + (frame.size.width - size.width) / 2
-                    y = frame.origin.y + (frame.size.height - size.height) / 2
-                    countdown_inst.window.setFrameOrigin_(AppKit.NSMakePoint(x, y))
-                    countdown_inst.window.setLevel_(AppKit.NSStatusWindowLevel)
-                    countdown_inst.window.makeKeyAndOrderFront_(None)
-                except Exception as e:
-                    log.debug("countdown window positioning failed: %s", e)
-
-            AppHelper.callAfter(_apply)
-        except Exception as e:
-            log.debug("countdown window positioning failed: %s", e)
-
 
 def main() -> None:
     _acquire_instance_lock()
@@ -1469,20 +1205,7 @@ def main() -> None:
         hidden=True,
         background_color="#0B0B0B",
     )
-    countdown_window = webview.create_window(
-        "Argus",
-        str(WEB_DIR / "countdown.html"),
-        js_api=api,
-        width=440,
-        height=280,
-        frameless=True,
-        easy_drag=False,
-        on_top=True,
-        resizable=False,
-        hidden=True,
-        background_color="#0B0B0B",
-    )
-    api._attach_windows(main_window, mini_window, countdown_window)
+    api._attach_windows(main_window, mini_window)
 
     def hide_on_close():
         # Clicking the red traffic-light button used to destroy main_window
